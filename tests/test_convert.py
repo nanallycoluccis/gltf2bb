@@ -163,6 +163,32 @@ class ConvertModelTest(unittest.TestCase):
         self.assertEqual(report["totals"]["merged_bones"], 1)
         self.assertIn("small_cubes", report["totals"])
 
+    def test_convert_report_includes_quality_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "quality_diagnostics.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            write_quality_diagnostics_fixture(model_path)
+
+            convert_model(model_path, output_path, target_height=4.0, report_path=report_path)
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        quality = report["quality"]
+        self.assertEqual(quality["skipped_unskinned_meshes_summary"]["count"], 1)
+        self.assertEqual(quality["skipped_unskinned_meshes_summary"]["node_indices"], [2])
+        self.assertEqual(quality["skipped_unskinned_meshes_summary"]["mesh_indices"], [0])
+
+        largest = quality["largest_cubes"][0]
+        self.assertEqual(largest["name"], "root_joint_cube")
+        self.assertEqual(largest["owner_bone_name"], "root_joint")
+        self.assertEqual(largest["dimensions"], [40.0, 4.0, 0.0])
+        self.assertIsNone(largest["rotation_source"])
+
+        elongated = quality["unrotated_elongated_cubes"][0]
+        self.assertEqual(elongated["name"], "root_joint_cube")
+        self.assertIn("no rotation", elongated["reason"])
+        self.assertEqual(quality["tiny_fragment_cubes"], [])
+
     def test_complex_split_head_outputs_subpart_cubes_under_head_group(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = Path(temp_dir) / "complex_head.gltf"
@@ -370,6 +396,78 @@ class ConvertModelTest(unittest.TestCase):
             {"foot_skin", "foot_shoe", "foot_heel"},
         )
         self.assertEqual({subpart["method"] for subpart in foot_split["subparts"]}, {"regular_material_component"})
+        self.assertEqual(report["hybrid_detail_split"]["min_faces"], 200)
+        self.assertTrue(report["hybrid_detail_split"]["by_material"])
+        self.assertTrue(report["hybrid_detail_split"]["by_connected_component"])
+
+    def test_hybrid_detail_split_config_can_disable_regular_detail_split(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "material_detail_foot.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            config_path = Path(temp_dir) / "config.json"
+            write_material_detail_foot_fixture(model_path)
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "hybrid_detail_split": {
+                            "by_material": False,
+                            "by_connected_component": False,
+                            "min_faces": 300,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = convert_model(
+                model_path,
+                output_path,
+                mode="hybrid",
+                target_height=10.0,
+                config_path=config_path,
+                report_path=report_path,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        element_names = {element["name"] for element in data["elements"]}
+        self.assertIn("foot_cube", element_names)
+        self.assertNotIn("foot_skin_cube", element_names)
+        self.assertEqual(len(result.cubes), 2)
+        self.assertEqual(report["complex_split"], [])
+        self.assertEqual(report["hybrid_detail_split"]["min_faces"], 300)
+        self.assertFalse(report["hybrid_detail_split"]["by_material"])
+        self.assertFalse(report["hybrid_detail_split"]["by_connected_component"])
+
+    def test_head_hair_continuity_merges_tiny_middle_bucket_and_expands_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "hair_continuity.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            write_hair_continuity_fixture(model_path)
+
+            result = convert_model(
+                model_path,
+                output_path,
+                target_height=4.0,
+                complex_split=("head",),
+                report_path=report_path,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(result.cubes), 2)
+        self.assertEqual({element["name"] for element in data["elements"]}, {"hair_front_left_cube", "hair_front_right_cube"})
+
+        head_split = report["complex_split"][0]
+        self.assertEqual(head_split["bone_name"], "head")
+        self.assertEqual(head_split["merged_tiny_hair_buckets"], 1)
+        self.assertEqual(head_split["expanded_hair_bucket_overlap"], 2)
+        self.assertEqual(
+            {subpart["name"] for subpart in head_split["subparts"]},
+            {"hair_front_left", "hair_front_right"},
+        )
 
     def test_complex_split_projects_eye_and_mouth_cubes_outside_head_core(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -704,6 +802,59 @@ def write_thin_nonzero_triangle_fixture(path: Path) -> None:
         "meshes": [
             {
                 "name": "thin_nonzero_triangle",
+                "primitives": [
+                    {
+                        "attributes": {"POSITION": 0, "JOINTS_0": 1, "WEIGHTS_0": 2},
+                        "mode": 4,
+                    }
+                ],
+            }
+        ],
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"},
+            {"bufferView": 1, "componentType": 5121, "count": 3, "type": "VEC4"},
+            {"bufferView": 2, "componentType": 5126, "count": 3, "type": "VEC4"},
+        ],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": len(positions)},
+            {"buffer": 0, "byteOffset": len(positions), "byteLength": len(joints)},
+            {"buffer": 0, "byteOffset": len(positions) + len(joints), "byteLength": len(weights)},
+        ],
+        "buffers": [
+            {
+                "byteLength": len(positions) + len(joints) + len(weights),
+                "uri": f"data:application/octet-stream;base64,{payload}",
+            }
+        ],
+    }
+    path.write_text(json.dumps(model), encoding="utf-8")
+
+
+def write_quality_diagnostics_fixture(path: Path) -> None:
+    positions = b"".join(
+        struct.pack("<fff", *point)
+        for point in [
+            (0.0, 0.0, 0.0),
+            (10.0, 1.0, 0.0),
+            (0.2, 0.0, 0.0),
+        ]
+    )
+    joints = bytes([0, 0, 0, 0] * 3)
+    weights = b"".join(struct.pack("<ffff", 1.0, 0.0, 0.0, 0.0) for _ in range(3))
+    payload = base64.b64encode(positions + joints + weights).decode("ascii")
+    model = {
+        "asset": {"version": "2.0", "generator": "gltf2bb quality diagnostics convert test"},
+        "scene": 0,
+        "scenes": [{"nodes": [1, 2]}],
+        "nodes": [
+            {"name": "root_joint"},
+            {"name": "skinned_mesh_node", "mesh": 0, "skin": 0},
+            {"name": "static_mesh_node", "mesh": 0},
+        ],
+        "skins": [{"joints": [0]}],
+        "meshes": [
+            {
+                "name": "quality_diagnostics_mesh",
                 "primitives": [
                     {
                         "attributes": {"POSITION": 0, "JOINTS_0": 1, "WEIGHTS_0": 2},
@@ -1181,6 +1332,24 @@ def write_hybrid_body_hair_fixture(path: Path) -> None:
             }
         ],
     }
+    path.write_text(json.dumps(model), encoding="utf-8")
+
+
+def write_hair_continuity_fixture(path: Path) -> None:
+    model = build_head_feature_model(
+        [
+            ([(-2.4, 1.0, -1.4), (-2.0, 1.0, -1.4), (-2.2, 1.6, -1.4)], 0),
+            ([(-2.5, 1.1, -1.3), (-1.9, 1.0, -1.3), (-2.2, 1.7, -1.3)], 0),
+            ([(-2.3, 0.9, -1.2), (-1.8, 1.0, -1.2), (-2.0, 1.7, -1.2)], 0),
+            ([(-2.1, 1.1, -1.1), (-1.7, 1.1, -1.1), (-1.9, 1.8, -1.1)], 0),
+            ([(-0.1, 1.0, -1.2), (0.1, 1.0, -1.2), (0.0, 1.6, -1.2)], 0),
+            ([(1.7, 1.0, -1.4), (2.1, 1.0, -1.4), (1.9, 1.7, -1.4)], 0),
+            ([(1.8, 1.1, -1.3), (2.4, 1.0, -1.3), (2.1, 1.8, -1.3)], 0),
+            ([(1.9, 0.9, -1.2), (2.5, 1.0, -1.2), (2.2, 1.7, -1.2)], 0),
+            ([(1.7, 1.1, -1.1), (2.1, 1.1, -1.1), (1.9, 1.8, -1.1)], 0),
+        ],
+        [{"name": "front hair"}],
+    )
     path.write_text(json.dumps(model), encoding="utf-8")
 
 

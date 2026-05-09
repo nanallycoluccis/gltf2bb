@@ -8,7 +8,14 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from .config import CleanupConfig, ComplexSplitConfig, OrientedCubesConfig, ProcessingConfig, resolve_processing_config
+from .config import (
+    CleanupConfig,
+    ComplexSplitConfig,
+    HybridDetailSplitConfig,
+    OrientedCubesConfig,
+    ProcessingConfig,
+    resolve_processing_config,
+)
 from .constants import MODE_TRIANGLES, MODE_TRIANGLE_FAN, MODE_TRIANGLE_STRIP
 from .errors import ConvertError, InspectError
 from .inspect import SUPPORTED_MODEL_SUFFIXES, build_parent_map, is_valid_index, load_gltf, read_accessor
@@ -33,6 +40,10 @@ ZERO_THICKNESS_MIN_PLANE_DIMENSION = MIN_CUBE_SIZE * 8.0
 DEFAULT_COMPLEX_SPLIT_BONE = "head"
 SUPPORTED_CONVERT_MODES = {"cuboid", "hybrid"}
 HYBRID_SPECIAL_CUBE_BONES = ("head", "hair", "skirt", "coat", "accessory")
+QUALITY_LARGEST_CUBES_LIMIT = 10
+QUALITY_TINY_FRAGMENT_CUBES_LIMIT = 20
+QUALITY_ELONGATED_DIMENSION_RATIO = 6.0
+QUALITY_TINY_FRAGMENT_MAX_FACES = 2
 AUTO_SPATIAL_SPLIT_MIN_FACES = 48
 AUTO_SPATIAL_SPLIT_VOLUME_RATIO = 0.004
 AUTO_SPATIAL_SPLIT_LONG_DIM_RATIO = 0.30
@@ -50,12 +61,10 @@ HEAD_HAIR_COMPONENT_PRESERVE_LIMIT = 8
 DEFAULT_HEAD_FRONT_SIGN = -1
 HEAD_DETAIL_AUTO_ORIENT_MIN_VOLUME_REDUCTION = 0.03
 HEAD_ACCESSORY_SPLIT_MIN_FACES = 24
-REGULAR_DETAIL_SPLIT_MIN_FACES = 200
-REGULAR_DETAIL_SPLIT_MIN_MATERIAL_FACES = 48
-REGULAR_DETAIL_SPLIT_MIN_MATERIAL_RATIO = 0.10
-REGULAR_DETAIL_SPLIT_MIN_COMPONENT_FACES = 16
-REGULAR_DETAIL_SPLIT_MIN_COMPONENT_RATIO = 0.05
-REGULAR_DETAIL_SPLIT_MAX_LONG_DIM_RATIO = 0.16
+HAIR_BUCKET_MIN_FACES = 4
+HAIR_BUCKET_MIN_FACE_RATIO = 0.08
+HAIR_BUCKET_OVERLAP_RATIO = 0.015
+HAIR_BUCKET_OVERLAP_MIN = MIN_CUBE_SIZE * 0.25
 COMPLEX_BONE_ALIASES = {
     "head": ("head", "頭", "頭部"),
     "hair": ("hair", "髪", "hair_", "hair-"),
@@ -119,6 +128,7 @@ class BBoxAccumulator:
 @dataclass
 class Cuboid:
     owner_bone: int
+    owner_bone_name: str
     name: str
     from_xyz: list[float]
     to_xyz: list[float]
@@ -147,6 +157,19 @@ class AutoSpatialPart:
 
 
 @dataclass
+class HairSplitPart:
+    name: str
+    faces: list[SplitFace]
+    split_axes: set[int] = field(default_factory=set)
+
+
+@dataclass
+class HairSplitResult:
+    parts: list[HairSplitPart]
+    merged_tiny_buckets: int = 0
+
+
+@dataclass
 class ComplexSplitSubpartReport:
     name: str
     method: str
@@ -162,6 +185,8 @@ class ComplexSplitBoneReport:
     subparts: list[ComplexSplitSubpartReport]
     merged_tiny_components: int = 0
     deleted_tiny_components: int = 0
+    merged_tiny_hair_buckets: int = 0
+    expanded_hair_bucket_overlap: int = 0
 
 
 @dataclass
@@ -202,6 +227,12 @@ class HybridModeReport:
     cuboid_strategy: str = "one_bbox_per_resolved_bone"
 
 
+@dataclass(frozen=True)
+class SkippedUnskinnedMesh:
+    node_index: int
+    mesh_index: int
+
+
 @dataclass
 class ConvertResult:
     input_path: Path
@@ -217,6 +248,8 @@ class ConvertResult:
     cleanup: CleanupReport
     oriented_cubes: list[OrientedCubeReport]
     hybrid: HybridModeReport
+    hybrid_detail_split: HybridDetailSplitConfig
+    skipped_unskinned_meshes: list[SkippedUnskinnedMesh]
     warnings: list[str]
 
 
@@ -266,6 +299,7 @@ def convert_model(
     accumulators: dict[PartKey, BBoxAccumulator] = {}
     regular_faces_by_part: dict[PartKey, list[SplitFace]] = {}
     split_faces: list[SplitFace] = []
+    skipped_unskinned_meshes: list[SkippedUnskinnedMesh] = []
 
     scratch_report = PartitionReport(
         path=input_path,
@@ -290,6 +324,7 @@ def convert_model(
             warnings.append(f"Node {node_index} references missing mesh {mesh_index}; skipped convert.")
             continue
         if skin_index is None:
+            skipped_unskinned_meshes.append(SkippedUnskinnedMesh(node_index=node_index, mesh_index=mesh_index))
             warnings.append(f"Node {node_index} mesh {mesh_index} has no skin; skipped convert.")
             continue
         if not is_valid_index(skins, skin_index):
@@ -329,7 +364,9 @@ def convert_model(
             )
 
     complex_split_report = apply_complex_split(split_faces, accumulators, config.complex_split, vrm_humanoid_nodes)
-    complex_split_report.extend(apply_regular_detail_split(accumulators, regular_faces_by_part, bones, mode))
+    complex_split_report.extend(
+        apply_regular_detail_split(accumulators, regular_faces_by_part, bones, mode, config.hybrid_detail_split)
+    )
     complex_split_report.extend(apply_auto_spatial_split(accumulators, regular_faces_by_part, bones, mode))
     cleanup_report = apply_cleanup(accumulators, bones, config.cleanup, warnings, regular_faces_by_part)
     populated = {
@@ -374,6 +411,8 @@ def convert_model(
         cleanup=cleanup_report,
         oriented_cubes=oriented_cube_report,
         hybrid=hybrid_report,
+        hybrid_detail_split=config.hybrid_detail_split,
+        skipped_unskinned_meshes=skipped_unskinned_meshes,
         warnings=warnings,
     )
     if report_path is not None:
@@ -660,8 +699,10 @@ def apply_head_complex_split(
     report_methods: dict[str, str] = {}
     pending_hair_parts: dict[str, list[tuple[str, list[SplitFace]]]] = {}
     pending_accessory_parts: dict[str, list[tuple[str, list[SplitFace]]]] = {}
+    merged_tiny_hair_buckets = 0
+    expanded_hair_bucket_overlap = 0
 
-    def add_to_part(part_name: str, method: str, part_faces: list[SplitFace]) -> None:
+    def add_to_part(part_name: str, method: str, part_faces: list[SplitFace]) -> BBoxAccumulator:
         accumulator = accumulators.setdefault(PartKey(owner_bone, part_name), BBoxAccumulator())
         accumulator.is_complex_split = True
         report_accumulator = report_accumulators.setdefault(part_name, BBoxAccumulator())
@@ -673,6 +714,7 @@ def apply_head_complex_split(
             report_methods[part_name] = method
         elif existing_method != method:
             report_methods[part_name] = "mixed"
+        return accumulator
 
     def add_hair_to_parts(part_name: str, method: str, part_faces: list[SplitFace]) -> None:
         if part_faces:
@@ -683,6 +725,7 @@ def apply_head_complex_split(
             pending_accessory_parts.setdefault(part_name, []).append((method, part_faces))
 
     def flush_hair_parts() -> None:
+        nonlocal merged_tiny_hair_buckets, expanded_hair_bucket_overlap
         for part_name, chunks in sorted(pending_hair_parts.items()):
             if len(chunks) <= HEAD_HAIR_COMPONENT_PRESERVE_LIMIT:
                 hair_chunks = chunks
@@ -693,8 +736,12 @@ def apply_head_complex_split(
                 hair_chunks = [(merged_method, merged_faces)]
 
             for method, part_faces in hair_chunks:
-                for split_part_name, split_faces in split_hair_part_faces(part_name, part_faces, owner_bbox):
-                    add_to_part(unique_part_name(split_part_name, report_accumulators), method, split_faces)
+                split_result = split_hair_part_faces(part_name, part_faces, owner_bbox)
+                merged_tiny_hair_buckets += split_result.merged_tiny_buckets
+                for split_part in split_result.parts:
+                    part_accumulator = add_to_part(unique_part_name(split_part.name, report_accumulators), method, split_part.faces)
+                    if split_part.split_axes and expand_hair_bucket_accumulator(part_accumulator, split_part.split_axes):
+                        expanded_hair_bucket_overlap += 1
 
     def flush_accessory_parts() -> None:
         for part_name, chunks in sorted(pending_accessory_parts.items()):
@@ -803,6 +850,8 @@ def apply_head_complex_split(
         subparts=subparts,
         merged_tiny_components=merged_tiny_components,
         deleted_tiny_components=deleted_tiny_components,
+        merged_tiny_hair_buckets=merged_tiny_hair_buckets,
+        expanded_hair_bucket_overlap=expanded_hair_bucket_overlap,
     )
 
 
@@ -876,8 +925,9 @@ def apply_regular_detail_split(
     regular_faces_by_part: dict[PartKey, list[SplitFace]],
     bones: dict[int, BonePartition],
     mode: str,
+    detail_split: HybridDetailSplitConfig,
 ) -> list[ComplexSplitBoneReport]:
-    if mode != "hybrid":
+    if mode != "hybrid" or not detail_split.enabled:
         return []
 
     populated = [
@@ -893,14 +943,14 @@ def apply_regular_detail_split(
     reports: list[ComplexSplitBoneReport] = []
     for part_key, faces in sorted(list(regular_faces_by_part.items()), key=lambda item: (item[0].owner_bone, item[0].name)):
         accumulator = accumulators.get(part_key)
-        if accumulator is None or accumulator.is_complex_split or len(faces) < REGULAR_DETAIL_SPLIT_MIN_FACES:
+        if accumulator is None or accumulator.is_complex_split or len(faces) < detail_split.min_faces:
             continue
         if accumulator.min_xyz is None or accumulator.max_xyz is None:
             continue
-        if not should_regular_detail_split_accumulator(accumulator, model_height):
+        if not should_regular_detail_split_accumulator(accumulator, model_height, detail_split):
             continue
 
-        split_specs = regular_detail_split_specs(part_key.name, faces)
+        split_specs = regular_detail_split_specs(part_key.name, faces, detail_split)
         if len(split_specs) < 2:
             continue
 
@@ -941,23 +991,46 @@ def apply_regular_detail_split(
     return reports
 
 
-def should_regular_detail_split_accumulator(accumulator: BBoxAccumulator, model_height: float) -> bool:
+def should_regular_detail_split_accumulator(
+    accumulator: BBoxAccumulator,
+    model_height: float,
+    detail_split: HybridDetailSplitConfig,
+) -> bool:
     if accumulator.min_xyz is None or accumulator.max_xyz is None:
         return False
     dimensions = bbox_dimensions(accumulator.min_xyz, accumulator.max_xyz)
-    return max(dimensions) / model_height <= REGULAR_DETAIL_SPLIT_MAX_LONG_DIM_RATIO
+    return max(dimensions) / model_height <= detail_split.max_long_dim_ratio
 
 
-def regular_detail_split_specs(part_name: str, faces: list[SplitFace]) -> list[tuple[str, str, list[SplitFace]]]:
-    material_specs = regular_material_split_specs(part_name, faces)
+def regular_detail_split_specs(
+    part_name: str,
+    faces: list[SplitFace],
+    detail_split: HybridDetailSplitConfig,
+) -> list[tuple[str, str, list[SplitFace]]]:
+    material_specs = regular_material_split_specs(part_name, faces, detail_split) if detail_split.by_material else []
     if len(material_specs) >= 2:
         result: list[tuple[str, str, list[SplitFace]]] = []
         for material_name, material_faces in material_specs:
-            result.extend(split_regular_faces_by_components(material_name, material_faces, "regular_material_component"))
+            if detail_split.by_connected_component:
+                result.extend(
+                    split_regular_faces_by_components(
+                        material_name,
+                        material_faces,
+                        "regular_material_component",
+                        detail_split,
+                    )
+                )
+            else:
+                result.append((material_name, "regular_material", material_faces))
         return result
-    if not should_split_single_material_components(part_name, faces):
+    if not detail_split.by_connected_component or not should_split_single_material_components(part_name, faces):
         return [(sanitize_part_name(part_name), "regular_detail", faces)]
-    return split_regular_faces_by_components(sanitize_part_name(part_name), faces, "regular_connected_component")
+    return split_regular_faces_by_components(
+        sanitize_part_name(part_name),
+        faces,
+        "regular_connected_component",
+        detail_split,
+    )
 
 
 def should_split_single_material_components(part_name: str, faces: list[SplitFace]) -> bool:
@@ -967,7 +1040,11 @@ def should_split_single_material_components(part_name: str, faces: list[SplitFac
     return material_part in {"hair", "head_accessory"}
 
 
-def regular_material_split_specs(part_name: str, faces: list[SplitFace]) -> list[tuple[str, list[SplitFace]]]:
+def regular_material_split_specs(
+    part_name: str,
+    faces: list[SplitFace],
+    detail_split: HybridDetailSplitConfig,
+) -> list[tuple[str, list[SplitFace]]]:
     faces_by_material: dict[str, list[SplitFace]] = {}
     unnamed_faces: list[SplitFace] = []
     for face in faces:
@@ -980,8 +1057,8 @@ def regular_material_split_specs(part_name: str, faces: list[SplitFace]) -> list
         return []
 
     min_faces = max(
-        REGULAR_DETAIL_SPLIT_MIN_MATERIAL_FACES,
-        math.ceil(len(faces) * REGULAR_DETAIL_SPLIT_MIN_MATERIAL_RATIO),
+        detail_split.min_material_faces,
+        math.ceil(len(faces) * detail_split.min_material_ratio),
     )
     significant: list[tuple[str, list[SplitFace]]] = []
     remainder: list[SplitFace] = list(unnamed_faces)
@@ -1001,6 +1078,7 @@ def split_regular_faces_by_components(
     base_name: str,
     faces: list[SplitFace],
     method: str,
+    detail_split: HybridDetailSplitConfig,
 ) -> list[tuple[str, str, list[SplitFace]]]:
     if len(faces) < 2:
         return [(base_name, method, faces)]
@@ -1010,8 +1088,8 @@ def split_regular_faces_by_components(
         return [(base_name, method, faces)]
 
     min_faces = max(
-        REGULAR_DETAIL_SPLIT_MIN_COMPONENT_FACES,
-        math.ceil(len(faces) * REGULAR_DETAIL_SPLIT_MIN_COMPONENT_RATIO),
+        detail_split.min_component_faces,
+        math.ceil(len(faces) * detail_split.min_component_ratio),
     )
     large_components = [component for component in component_indices if len(component) >= min_faces]
     if len(large_components) < 2:
@@ -1499,9 +1577,9 @@ def split_hair_part_faces(
     part_name: str,
     faces: list[SplitFace],
     owner_bbox: tuple[list[float], list[float]],
-) -> list[tuple[str, list[SplitFace]]]:
+) -> HairSplitResult:
     if len(faces) < 2:
-        return [(part_name, faces)]
+        return HairSplitResult(parts=[HairSplitPart(part_name, faces)])
 
     part_min, part_max = faces_bbox(faces)
     owner_min, owner_max = owner_bbox
@@ -1510,18 +1588,122 @@ def split_hair_part_faces(
     part_height = part_max[1] - part_min[1]
     owner_height = owner_max[1] - owner_min[1]
 
-    parts = [(part_name, faces)]
+    parts = [HairSplitPart(part_name, faces)]
+    merged_tiny_buckets = 0
     if len(faces) >= 6 and part_name in {"hair", "hair_front", "hair_back", "hair_top"}:
         if part_width > EPSILON and owner_width > EPSILON and part_width >= owner_width * 0.45:
             segment_count = 3 if len(faces) < 1500 else 4
-            parts = split_faces_by_axis(parts, axis=0, segment_count=segment_count, suffixes=horizontal_suffixes(segment_count))
+            parts = split_hair_parts_by_axis(parts, axis=0, segment_count=segment_count, suffixes=horizontal_suffixes(segment_count))
+            parts, merged = merge_tiny_hair_face_parts(parts, owner_bbox)
+            merged_tiny_buckets += merged
 
     if len(faces) < 250 or part_height <= EPSILON or owner_height <= EPSILON or part_height < owner_height * 0.3:
-        return parts
+        return HairSplitResult(parts=parts, merged_tiny_buckets=merged_tiny_buckets)
 
     segment_count = max(math.ceil(part_height / (owner_height * 0.3)), math.ceil(len(faces) / 2500))
     segment_count = max(2, min(segment_count, 4))
-    return split_faces_by_axis(parts, axis=1, segment_count=segment_count, suffixes=vertical_suffixes(segment_count))
+    parts = split_hair_parts_by_axis(parts, axis=1, segment_count=segment_count, suffixes=vertical_suffixes(segment_count))
+    parts, merged = merge_tiny_hair_face_parts(parts, owner_bbox)
+    merged_tiny_buckets += merged
+    return HairSplitResult(parts=parts, merged_tiny_buckets=merged_tiny_buckets)
+
+
+def split_hair_parts_by_axis(
+    parts: list[HairSplitPart],
+    axis: int,
+    segment_count: int,
+    suffixes: list[str],
+) -> list[HairSplitPart]:
+    result: list[HairSplitPart] = []
+    for part in parts:
+        split_parts = split_faces_by_axis([(part.name, part.faces)], axis, segment_count, suffixes)
+        if len(split_parts) == 1:
+            split_name, split_faces = split_parts[0]
+            if split_name == part.name and split_faces is part.faces:
+                result.append(part)
+            else:
+                result.append(HairSplitPart(split_name, split_faces, split_axes=set(part.split_axes)))
+            continue
+
+        next_split_axes = set(part.split_axes)
+        next_split_axes.add(axis)
+        for split_name, split_faces in split_parts:
+            result.append(HairSplitPart(split_name, split_faces, split_axes=set(next_split_axes)))
+    return result
+
+
+def merge_tiny_hair_face_parts(
+    parts: list[HairSplitPart],
+    owner_bbox: tuple[list[float], list[float]],
+) -> tuple[list[HairSplitPart], int]:
+    if len(parts) < 2:
+        return parts, 0
+
+    owner_min, owner_max = owner_bbox
+    owner_dimensions = bbox_dimensions(owner_min, owner_max)
+    owner_longest = max(owner_dimensions) if owner_dimensions else 0.0
+    min_faces = max(HAIR_BUCKET_MIN_FACES, math.ceil(sum(len(part.faces) for part in parts) * HAIR_BUCKET_MIN_FACE_RATIO))
+
+    kept: list[HairSplitPart] = []
+    tiny: list[HairSplitPart] = []
+    for part in parts:
+        part_min, part_max = faces_bbox(part.faces)
+        part_dimensions = bbox_dimensions(part_min, part_max)
+        part_longest = max(part_dimensions) if part_dimensions else 0.0
+        tiny_by_span = part_longest <= max(owner_longest * 0.12, MIN_CUBE_SIZE * 2.0)
+        if len(part.faces) < min_faces or tiny_by_span:
+            tiny.append(part)
+        else:
+            kept.append(part)
+
+    if not kept or not tiny:
+        return parts, 0
+
+    merged_count = 0
+    for tiny_part in tiny:
+        tiny_centroid = points_centroid([point for face in tiny_part.faces for point in face.points])
+        target_index = min(
+            range(len(kept)),
+            key=lambda index: squared_distance(
+                tiny_centroid,
+                points_centroid([point for face in kept[index].faces for point in face.points]),
+            ),
+        )
+        kept[target_index].faces.extend(tiny_part.faces)
+        kept[target_index].split_axes.update(tiny_part.split_axes)
+        merged_count += 1
+
+    return kept, merged_count
+
+
+def expand_hair_bucket_accumulator(accumulator: BBoxAccumulator, split_axes: set[int]) -> bool:
+    if not split_axes or accumulator.min_xyz is None or accumulator.max_xyz is None:
+        return False
+
+    dimensions = bbox_dimensions(accumulator.min_xyz, accumulator.max_xyz)
+    margin = hair_bucket_overlap_margin(dimensions)
+    if margin <= EPSILON:
+        return False
+
+    expanded_min = accumulator.min_xyz.copy()
+    expanded_max = accumulator.max_xyz.copy()
+    for axis in sorted(split_axes):
+        expanded_min[axis] -= margin
+        expanded_max[axis] += margin
+
+    accumulator.min_xyz = expanded_min
+    accumulator.max_xyz = expanded_max
+    base_index = len(accumulator.points_by_vertex)
+    for index, corner in enumerate(bbox_corners(expanded_min, expanded_max)):
+        accumulator.points_by_vertex[("hair_overlap", base_index + index)] = corner.copy()
+    return True
+
+
+def hair_bucket_overlap_margin(dimensions: list[float]) -> float:
+    largest = max(dimensions) if dimensions else 0.0
+    if largest <= EPSILON:
+        return HAIR_BUCKET_OVERLAP_MIN
+    return max(largest * HAIR_BUCKET_OVERLAP_RATIO, HAIR_BUCKET_OVERLAP_MIN)
 
 
 def split_head_accessory_part_faces(
@@ -2071,6 +2253,8 @@ def build_cuboids(
     for part_key, accumulator in sorted(accumulators.items(), key=lambda item: (item[0].owner_bone, item[0].name)):
         if accumulator.min_xyz is None or accumulator.max_xyz is None:
             continue
+        bone = bones.get(part_key.owner_bone)
+        owner_bone_name = bone.name if bone is not None else f"bone_{part_key.owner_bone}"
         world_matrix = world_matrices.get(part_key.owner_bone, identity_matrix())
         origin = to_blockbench_space(
             matrix_translation(world_matrix), scale, offset
@@ -2122,6 +2306,7 @@ def build_cuboids(
         cuboids.append(
             Cuboid(
                 owner_bone=part_key.owner_bone,
+                owner_bone_name=owner_bone_name,
                 name=cube_name,
                 from_xyz=from_xyz,
                 to_xyz=to_xyz,
@@ -2133,12 +2318,11 @@ def build_cuboids(
             )
         )
         if rotation_source is not None:
-            bone = bones.get(part_key.owner_bone)
             reports.append(
                 OrientedCubeReport(
                     name=cube_name,
                     owner_bone=part_key.owner_bone,
-                    owner_bone_name=bone.name if bone is not None else f"bone_{part_key.owner_bone}",
+                    owner_bone_name=owner_bone_name,
                     rotation=rotation,
                     source=rotation_source,
                 )
@@ -2827,9 +3011,11 @@ def convert_result_to_dict(result: ConvertResult) -> dict[str, Any]:
         },
         "bone_resolution": bone_resolution_to_dict(result.bone_resolution),
         "hybrid": hybrid_to_dict(result.hybrid),
+        "hybrid_detail_split": hybrid_detail_split_to_dict(result.hybrid_detail_split),
         "complex_split": [complex_split_to_dict(item) for item in result.complex_split],
         "cleanup": cleanup_to_dict(result.cleanup),
         "oriented_cubes": [oriented_cube_to_dict(item) for item in result.oriented_cubes],
+        "quality": quality_to_dict(result),
         "cubes": [cuboid_to_dict(cuboid) for cuboid in result.cubes],
         "warnings": result.warnings,
 }
@@ -2844,6 +3030,20 @@ def hybrid_to_dict(item: HybridModeReport) -> dict[str, Any]:
     }
 
 
+def hybrid_detail_split_to_dict(item: HybridDetailSplitConfig) -> dict[str, Any]:
+    return {
+        "enabled": item.enabled,
+        "min_faces": item.min_faces,
+        "max_long_dim_ratio": item.max_long_dim_ratio,
+        "by_material": item.by_material,
+        "by_connected_component": item.by_connected_component,
+        "min_material_faces": item.min_material_faces,
+        "min_material_ratio": item.min_material_ratio,
+        "min_component_faces": item.min_component_faces,
+        "min_component_ratio": item.min_component_ratio,
+    }
+
+
 def complex_split_to_dict(item: ComplexSplitBoneReport) -> dict[str, Any]:
     return {
         "bone": item.bone,
@@ -2852,6 +3052,8 @@ def complex_split_to_dict(item: ComplexSplitBoneReport) -> dict[str, Any]:
         "subparts": [complex_split_subpart_to_dict(subpart) for subpart in item.subparts],
         "merged_tiny_components": item.merged_tiny_components,
         "deleted_tiny_components": item.deleted_tiny_components,
+        "merged_tiny_hair_buckets": item.merged_tiny_hair_buckets,
+        "expanded_hair_bucket_overlap": item.expanded_hair_bucket_overlap,
     }
 
 
@@ -2895,6 +3097,134 @@ def oriented_cube_to_dict(item: OrientedCubeReport) -> dict[str, Any]:
         "rotation": rounded_vec(item.rotation),
         "source": item.source,
     }
+
+
+def quality_to_dict(result: ConvertResult) -> dict[str, Any]:
+    return {
+        "largest_cubes": [quality_cube_to_dict(cuboid) for cuboid in largest_quality_cubes(result.cubes)],
+        "unrotated_elongated_cubes": [
+            quality_unrotated_elongated_cube_to_dict(cuboid, reason)
+            for cuboid, reason in unrotated_elongated_quality_cubes(result.cubes)
+        ],
+        "tiny_fragment_cubes": [
+            quality_tiny_fragment_cube_to_dict(cuboid)
+            for cuboid in tiny_fragment_quality_cubes(result.cubes)
+        ],
+        "skipped_unskinned_meshes_summary": skipped_unskinned_meshes_summary_to_dict(
+            result.skipped_unskinned_meshes
+        ),
+    }
+
+
+def largest_quality_cubes(cuboids: list[Cuboid]) -> list[Cuboid]:
+    return sorted(
+        cuboids,
+        key=lambda cuboid: (cube_volume(cuboid), max(cube_dimensions(cuboid), default=0.0), cuboid.faces),
+        reverse=True,
+    )[:QUALITY_LARGEST_CUBES_LIMIT]
+
+
+def unrotated_elongated_quality_cubes(cuboids: list[Cuboid]) -> list[tuple[Cuboid, str]]:
+    flagged: list[tuple[Cuboid, str]] = []
+    for cuboid in cuboids:
+        reason = unrotated_elongated_reason(cuboid)
+        if reason is not None:
+            flagged.append((cuboid, reason))
+    return sorted(flagged, key=lambda item: cube_elongation_ratio(item[0]), reverse=True)
+
+
+def tiny_fragment_quality_cubes(cuboids: list[Cuboid]) -> list[Cuboid]:
+    model_height = model_height_from_cubes(cuboids)
+    max_dimension = max(MIN_CUBE_SIZE * 2.0, model_height * 0.03)
+    tiny = [
+        cuboid
+        for cuboid in cuboids
+        if cuboid.faces <= QUALITY_TINY_FRAGMENT_MAX_FACES
+        and max(cube_dimensions(cuboid), default=0.0) <= max_dimension
+    ]
+    return sorted(tiny, key=lambda cuboid: (cube_volume(cuboid), cuboid.faces, cuboid.name))[
+        :QUALITY_TINY_FRAGMENT_CUBES_LIMIT
+    ]
+
+
+def quality_cube_to_dict(cuboid: Cuboid) -> dict[str, Any]:
+    dimensions = cube_dimensions(cuboid)
+    return {
+        "name": cuboid.name,
+        "owner_bone": cuboid.owner_bone,
+        "owner_bone_name": cuboid.owner_bone_name,
+        "dimensions": rounded_vec(dimensions),
+        "volume": rounded_number(box_volume_from_dimensions(dimensions)),
+        "faces": cuboid.faces,
+        "rotation_source": cuboid.rotation_source,
+    }
+
+
+def quality_unrotated_elongated_cube_to_dict(cuboid: Cuboid, reason: str) -> dict[str, Any]:
+    data = quality_cube_to_dict(cuboid)
+    data["reason"] = reason
+    return data
+
+
+def quality_tiny_fragment_cube_to_dict(cuboid: Cuboid) -> dict[str, Any]:
+    dimensions = cube_dimensions(cuboid)
+    return {
+        "name": cuboid.name,
+        "owner_bone": cuboid.owner_bone,
+        "owner_bone_name": cuboid.owner_bone_name,
+        "faces": cuboid.faces,
+        "dimensions": rounded_vec(dimensions),
+        "volume": rounded_number(box_volume_from_dimensions(dimensions)),
+    }
+
+
+def skipped_unskinned_meshes_summary_to_dict(items: list[SkippedUnskinnedMesh]) -> dict[str, Any]:
+    return {
+        "count": len(items),
+        "node_indices": sorted({item.node_index for item in items}),
+        "mesh_indices": sorted({item.mesh_index for item in items}),
+    }
+
+
+def unrotated_elongated_reason(cuboid: Cuboid) -> str | None:
+    if has_nonzero_rotation(cuboid.rotation):
+        return None
+    ratio = cube_elongation_ratio(cuboid)
+    if ratio < QUALITY_ELONGATED_DIMENSION_RATIO:
+        return None
+    return f"long_dim/second_dim={ratio:.2f}>={QUALITY_ELONGATED_DIMENSION_RATIO:.2f}; no rotation"
+
+
+def cube_elongation_ratio(cuboid: Cuboid) -> float:
+    dimensions = sorted(cube_dimensions(cuboid), reverse=True)
+    if not dimensions or dimensions[0] <= EPSILON:
+        return 0.0
+    if len(dimensions) < 2 or dimensions[1] <= EPSILON:
+        return math.inf
+    return dimensions[0] / dimensions[1]
+
+
+def cube_dimensions(cuboid: Cuboid) -> list[float]:
+    return bbox_dimensions(cuboid.from_xyz, cuboid.to_xyz)
+
+
+def cube_volume(cuboid: Cuboid) -> float:
+    return box_volume_from_dimensions(cube_dimensions(cuboid))
+
+
+def model_height_from_cubes(cuboids: list[Cuboid]) -> float:
+    if not cuboids:
+        return 0.0
+    min_y = min(min(cuboid.from_xyz[1], cuboid.to_xyz[1]) for cuboid in cuboids)
+    max_y = max(max(cuboid.from_xyz[1], cuboid.to_xyz[1]) for cuboid in cuboids)
+    return max(max_y - min_y, 0.0)
+
+
+def rounded_number(value: float) -> float:
+    if not math.isfinite(value):
+        raise ConvertError("generated non-finite quality metric")
+    rounded = round(value, 6)
+    return 0.0 if rounded == -0.0 else rounded
 
 
 def cuboid_to_dict(cuboid: Cuboid) -> dict[str, Any]:

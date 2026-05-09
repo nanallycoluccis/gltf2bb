@@ -51,12 +51,26 @@ class OrientedCubesConfig:
 
 
 @dataclass(frozen=True)
+class HybridDetailSplitConfig:
+    enabled: bool = True
+    min_faces: int = 200
+    max_long_dim_ratio: float = 0.16
+    by_material: bool = True
+    by_connected_component: bool = True
+    min_material_faces: int = 48
+    min_material_ratio: float = 0.10
+    min_component_faces: int = 16
+    min_component_ratio: float = 0.05
+
+
+@dataclass(frozen=True)
 class ProcessingConfig:
     preset: str = "default"
     bone_filter: BoneFilterConfig = field(default_factory=BoneFilterConfig)
     complex_split: ComplexSplitConfig = field(default_factory=ComplexSplitConfig)
     cleanup: CleanupConfig = field(default_factory=CleanupConfig)
     oriented_cubes: OrientedCubesConfig = field(default_factory=OrientedCubesConfig)
+    hybrid_detail_split: HybridDetailSplitConfig = field(default_factory=HybridDetailSplitConfig)
 
 
 BUILTIN_PRESETS: dict[str, ProcessingConfig] = {
@@ -137,6 +151,7 @@ def merge_config_data(config: ProcessingConfig, data: dict[str, Any]) -> Process
     complex_split = config.complex_split
     cleanup = config.cleanup
     oriented_cubes = config.oriented_cubes
+    hybrid_detail_split = config.hybrid_detail_split
 
     raw_bone_filter = data.get("bone_filter")
     if isinstance(raw_bone_filter, dict):
@@ -168,12 +183,19 @@ def merge_config_data(config: ProcessingConfig, data: dict[str, Any]) -> Process
     elif raw_oriented_cubes is not None:
         raise ConfigError("oriented_cubes must be an object")
 
+    raw_hybrid_detail_split = data.get("hybrid_detail_split")
+    if isinstance(raw_hybrid_detail_split, dict):
+        hybrid_detail_split = merge_hybrid_detail_split_data(hybrid_detail_split, raw_hybrid_detail_split)
+    elif raw_hybrid_detail_split is not None:
+        raise ConfigError("hybrid_detail_split must be an object")
+
     return replace(
         config,
         bone_filter=bone_filter,
         complex_split=complex_split,
         cleanup=cleanup,
         oriented_cubes=oriented_cubes,
+        hybrid_detail_split=hybrid_detail_split,
     )
 
 
@@ -297,10 +319,44 @@ def merge_oriented_cubes_data(config: OrientedCubesConfig, data: dict[str, Any])
     return result
 
 
+def merge_hybrid_detail_split_data(
+    config: HybridDetailSplitConfig,
+    data: dict[str, Any],
+) -> HybridDetailSplitConfig:
+    updates: dict[str, Any] = {}
+    for key in ("enabled", "by_material", "by_connected_component"):
+        if key in data:
+            if not isinstance(data[key], bool):
+                raise ConfigError(f"hybrid_detail_split.{key} must be a boolean")
+            updates[key] = data[key]
+
+    for key in ("min_faces", "min_material_faces", "min_component_faces"):
+        if key in data:
+            updates[key] = parse_non_negative_int(data[key], f"hybrid_detail_split.{key}")
+
+    for key in ("max_long_dim_ratio", "min_material_ratio", "min_component_ratio"):
+        if key in data:
+            updates[key] = parse_non_negative_number(data[key], f"hybrid_detail_split.{key}")
+
+    return replace(config, **updates)
+
+
 def parse_string_list(value: Any, key: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ConfigError(f"{key} must be a list of strings")
     return tuple(item for item in value if item)
+
+
+def parse_non_negative_int(value: Any, key: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ConfigError(f"{key} must be a non-negative integer")
+    return value
+
+
+def parse_non_negative_number(value: Any, key: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+        raise ConfigError(f"{key} must be a non-negative number")
+    return float(value)
 
 
 def validate_config(config: ProcessingConfig) -> None:
