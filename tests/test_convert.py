@@ -225,6 +225,33 @@ class ConvertModelTest(unittest.TestCase):
         self.assertIsNotNone(head_entry)
         self.assertEqual(set(head_entry["children"]), cube_uuids)
 
+    def test_large_head_core_splits_into_multiple_body_cubes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "large_head_core.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            write_large_head_core_fixture(model_path)
+
+            result = convert_model(
+                model_path,
+                output_path,
+                target_height=4.0,
+                complex_split=("head",),
+                report_path=report_path,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        element_names = {element["name"] for element in data["elements"]}
+        self.assertGreaterEqual(len(result.cubes), 2)
+        self.assertNotIn("head_core_cube", element_names)
+        self.assertTrue(all(name.startswith("head_core_") for name in element_names))
+
+        head_split = report["complex_split"][0]
+        self.assertEqual(head_split["bone_name"], "head")
+        self.assertGreaterEqual(len(head_split["subparts"]), 2)
+        self.assertTrue(any(subpart["name"].startswith("head_core_") for subpart in head_split["subparts"]))
+
     def test_complex_split_merges_tiny_connected_components_to_nearest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = Path(temp_dir) / "head_tiny_component.gltf"
@@ -1160,6 +1187,25 @@ def write_slanted_thumb_fixture(path: Path) -> None:
 
 def write_head_complex_fixture(path: Path) -> None:
     model = build_head_complex_model("head", include_vrm_metadata=False)
+    path.write_text(json.dumps(model), encoding="utf-8")
+
+
+def write_large_head_core_fixture(path: Path) -> None:
+    def repeated_triangles(points: list[tuple[float, float, float]], count: int) -> list[tuple[float, float, float]]:
+        result: list[tuple[float, float, float]] = []
+        for _ in range(count):
+            result.extend(points)
+        return result
+
+    model = build_head_feature_model(
+        [
+            (repeated_triangles([(-1.2, 0.1, -1.1), (-0.8, 0.1, -1.1), (-1.0, 0.5, -1.1)], 225), 0),
+            (repeated_triangles([(-1.1, 0.6, -1.1), (-0.7, 0.6, -1.1), (-0.9, 1.0, -1.1)], 225), 0),
+            (repeated_triangles([(0.7, 0.1, 1.1), (1.1, 0.1, 1.1), (0.9, 0.5, 1.1)], 225), 0),
+            (repeated_triangles([(0.8, 0.6, 1.1), (1.2, 0.6, 1.1), (1.0, 1.0, 1.1)], 225), 0),
+        ],
+        [{"name": "face skin"}],
+    )
     path.write_text(json.dumps(model), encoding="utf-8")
 
 

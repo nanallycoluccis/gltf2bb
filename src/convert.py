@@ -61,6 +61,8 @@ HEAD_HAIR_COMPONENT_PRESERVE_LIMIT = 8
 DEFAULT_HEAD_FRONT_SIGN = -1
 HEAD_DETAIL_AUTO_ORIENT_MIN_VOLUME_REDUCTION = 0.03
 HEAD_ACCESSORY_SPLIT_MIN_FACES = 24
+HEAD_CORE_SPLIT_MIN_FACES = 800
+HEAD_CORE_SPLIT_MIN_BUCKET_FACES = 64
 HAIR_BUCKET_MIN_FACES = 4
 HAIR_BUCKET_MIN_FACE_RATIO = 0.08
 HAIR_BUCKET_OVERLAP_RATIO = 0.015
@@ -699,6 +701,7 @@ def apply_head_complex_split(
     report_methods: dict[str, str] = {}
     pending_hair_parts: dict[str, list[tuple[str, list[SplitFace]]]] = {}
     pending_accessory_parts: dict[str, list[tuple[str, list[SplitFace]]]] = {}
+    head_core_faces: list[SplitFace] = []
     merged_tiny_hair_buckets = 0
     expanded_hair_bucket_overlap = 0
 
@@ -714,6 +717,8 @@ def apply_head_complex_split(
             report_methods[part_name] = method
         elif existing_method != method:
             report_methods[part_name] = "mixed"
+        if part_name == "head_core":
+            head_core_faces.extend(part_faces)
         return accumulator
 
     def add_hair_to_parts(part_name: str, method: str, part_faces: list[SplitFace]) -> None:
@@ -833,6 +838,15 @@ def apply_head_complex_split(
     flush_accessory_parts()
     project_face_feature_parts(owner_bone, accumulators, report_accumulators, owner_bbox)
     project_side_feature_parts(owner_bone, accumulators, report_accumulators, owner_bbox)
+    split_head_core_parts(
+        owner_bone,
+        head_core_faces,
+        accumulators,
+        report_accumulators,
+        report_methods,
+        owner_bbox,
+        front_sign,
+    )
 
     subparts = [
         ComplexSplitSubpartReport(
@@ -1910,6 +1924,100 @@ def project_side_feature_parts(
         for target in (accumulator, accumulators.get(PartKey(owner_bone, name))):
             if target is not None:
                 project_accumulator_x(target, min_x, max_x)
+
+
+def split_head_core_parts(
+    owner_bone: int,
+    head_core_faces: list[SplitFace],
+    accumulators: dict[PartKey, BBoxAccumulator],
+    report_accumulators: dict[str, BBoxAccumulator],
+    report_methods: dict[str, str],
+    owner_bbox: tuple[list[float], list[float]],
+    front_sign: int,
+) -> None:
+    if len(head_core_faces) < HEAD_CORE_SPLIT_MIN_FACES:
+        return
+
+    head_core_key = PartKey(owner_bone, "head_core")
+    if head_core_key not in accumulators or "head_core" not in report_accumulators:
+        return
+
+    part_min, part_max = faces_bbox(head_core_faces)
+    dimensions = bbox_dimensions(part_min, part_max)
+    if max(dimensions, default=0.0) <= EPSILON:
+        return
+
+    split_parts: list[tuple[str, list[SplitFace]]] = [("head_core", head_core_faces)]
+    split_parts = split_faces_by_axis(
+        split_parts,
+        axis=2,
+        segment_count=2,
+        suffixes=head_core_depth_suffixes(front_sign),
+    )
+    split_parts, _merged_depth = merge_tiny_named_parts(split_parts, HEAD_CORE_SPLIT_MIN_BUCKET_FACES)
+    split_parts = split_faces_by_axis(
+        split_parts,
+        axis=1,
+        segment_count=2,
+        suffixes=vertical_suffixes(2),
+    )
+    split_parts, _merged_height = merge_tiny_named_parts(split_parts, HEAD_CORE_SPLIT_MIN_BUCKET_FACES)
+
+    if len(split_parts) <= 1:
+        return
+
+    del accumulators[head_core_key]
+    report_accumulators.pop("head_core", None)
+    report_methods.pop("head_core", None)
+
+    for part_name, part_faces in split_parts:
+        accumulator = accumulators.setdefault(PartKey(owner_bone, part_name), BBoxAccumulator())
+        accumulator.is_complex_split = True
+        report_accumulator = report_accumulators.setdefault(part_name, BBoxAccumulator())
+        for face in part_faces:
+            accumulator.add_face(face.points, face.vertex_keys)
+            report_accumulator.add_face(face.points, face.vertex_keys)
+        report_methods[part_name] = "spatial_region"
+
+
+def head_core_depth_suffixes(front_sign: int) -> list[str]:
+    if front_sign >= 0:
+        return ["back", "front"]
+    return ["front", "back"]
+
+
+def merge_tiny_named_parts(
+    parts: list[tuple[str, list[SplitFace]]],
+    min_faces: int,
+) -> tuple[list[tuple[str, list[SplitFace]]], int]:
+    if min_faces <= 0 or len(parts) < 2:
+        return parts, 0
+
+    kept: list[list[Any]] = []
+    tiny: list[tuple[str, list[SplitFace]]] = []
+    for name, part_faces in parts:
+        if len(part_faces) < min_faces:
+            tiny.append((name, part_faces))
+        else:
+            kept.append([name, part_faces])
+
+    if not kept or not tiny:
+        return parts, 0
+
+    merged_count = 0
+    for _tiny_name, tiny_faces in tiny:
+        tiny_centroid = points_centroid([point for face in tiny_faces for point in face.points])
+        target_index = min(
+            range(len(kept)),
+            key=lambda index: squared_distance(
+                tiny_centroid,
+                points_centroid([point for face in kept[index][1] for point in face.points]),
+            ),
+        )
+        kept[target_index][1].extend(tiny_faces)
+        merged_count += 1
+
+    return [(name, part_faces) for name, part_faces in kept], merged_count
 
 
 def is_side_feature_part(name: str) -> bool:
