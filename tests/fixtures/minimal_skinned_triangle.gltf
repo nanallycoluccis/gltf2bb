@@ -1,0 +1,83 @@
+{
+  "asset": {
+    "version": "2.0",
+    "generator": "gltf2bb M1 fixture"
+  },
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [2]
+    }
+  ],
+  "nodes": [
+    {
+      "name": "root_joint",
+      "children": [1]
+    },
+    {
+      "name": "child_joint"
+    },
+    {
+      "name": "mesh_node",
+      "mesh": 0,
+      "skin": 0
+    }
+  ],
+  "skins": [
+    {
+      "joints": [0, 1]
+    }
+  ],
+  "meshes": [
+    {
+      "name": "triangle",
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 0,
+            "JOINTS_0": 1,
+            "WEIGHTS_0": 2
+          },
+          "mode": 4
+        }
+      ]
+    }
+  ],
+  "accessors": [
+    {
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC3"
+    },
+    {
+      "bufferView": 0,
+      "componentType": 5121,
+      "count": 3,
+      "type": "VEC4"
+    },
+    {
+      "bufferView": 1,
+      "componentType": 5126,
+      "count": 3,
+      "type": "VEC4"
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 12
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 12,
+      "byteLength": 48
+    }
+  ],
+  "buffers": [
+    {
+      "byteLength": 60,
+      "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAAAAAIA/AAAAAAAAAAAAAAAA"
+    }
+  ]
+}

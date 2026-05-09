@@ -1,0 +1,36 @@
+GLB_MAGIC = b"glTF"
+GLB_VERSION = 2
+GLB_JSON_CHUNK_TYPE = 0x4E4F534A
+GLB_BIN_CHUNK_TYPE = 0x004E4942
+
+MODE_TRIANGLES = 4
+MODE_TRIANGLE_STRIP = 5
+MODE_TRIANGLE_FAN = 6
+
+COMPONENT_BYTE_SIZES = {
+    5120: 1,  # BYTE
+    5121: 1,  # UNSIGNED_BYTE
+    5122: 2,  # SHORT
+    5123: 2,  # UNSIGNED_SHORT
+    5125: 4,  # UNSIGNED_INT
+    5126: 4,  # FLOAT
+}
+
+TYPE_COMPONENT_COUNTS = {
+    "SCALAR": 1,
+    "VEC2": 2,
+    "VEC3": 3,
+    "VEC4": 4,
+    "MAT2": 4,
+    "MAT3": 9,
+    "MAT4": 16,
+}
+
+COMPONENT_STRUCT_FORMATS = {
+    5120: "b",
+    5121: "B",
+    5122: "h",
+    5123: "H",
+    5125: "I",
+    5126: "f",
+}
