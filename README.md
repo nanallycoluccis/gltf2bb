@@ -8,6 +8,7 @@ Quality optimization in progress
 
 - Convert glTF character model to Blockbench project
 - Native VRM 1.0 support
+
 ## Installation
 
 Requires UV installed
@@ -15,6 +16,12 @@ Requires UV installed
 ```bash
 uv sync
 ```
+
+## Usage
+
+- [General Usage](docs/usage.md)
+- [Work with MMD (*.pmx) models](docs/pmx.md)
+
 ## Authors
 
 - [ChatGPT](https://chatgpt.com/)
