@@ -252,6 +252,93 @@ class ConvertModelTest(unittest.TestCase):
         self.assertGreaterEqual(len(head_split["subparts"]), 2)
         self.assertTrue(any(subpart["name"].startswith("head_core_") for subpart in head_split["subparts"]))
 
+    def test_large_head_core_with_face_features_does_not_create_face_recess(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "large_head_core_face_features.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            write_large_head_core_with_face_features_fixture(model_path)
+
+            convert_model(
+                model_path,
+                output_path,
+                target_height=4.0,
+                complex_split=("head",),
+                report_path=report_path,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        elements = {element["name"]: element for element in data["elements"]}
+        self.assertIn("head_core_front_lower_cube", elements)
+        self.assertIn("head_core_front_upper_cube", elements)
+        self.assertFalse(any(name.startswith("head_core_front") and "face_recess" in name for name in elements))
+        self.assertFalse(any(name.startswith("head_core_front") and name.endswith("_face_cube") for name in elements))
+
+        subparts = {subpart["name"] for subpart in report["complex_split"][0]["subparts"]}
+        self.assertFalse(any(name.startswith("head_core_front") and "face_recess" in name for name in subparts))
+        self.assertFalse(any(name.startswith("head_core_front") and name.endswith("_face") for name in subparts))
+
+    def test_head_face_features_and_front_hair_keep_source_planes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "large_head_core_face_features.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            write_large_head_core_with_face_features_fixture(model_path, include_front_hair=True)
+
+            convert_model(
+                model_path,
+                output_path,
+                target_height=4.0,
+                complex_split=("head",),
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+
+        elements = {element["name"]: element for element in data["elements"]}
+        upper_hair = [element for name, element in elements.items() if name.startswith("hair_front") and "upper" in name]
+        self.assertTrue(upper_hair)
+
+        face_features = [
+            element
+            for name, element in elements.items()
+            if name.startswith(("eye", "brow", "mouth"))
+        ]
+        self.assertTrue(face_features)
+        for element in face_features:
+            self.assertEqual(element["from"][2], element["to"][2])
+
+        feature_max_y = max(
+            element["to"][1]
+            for element in face_features
+        )
+        self.assertLess(min(element["from"][1] for element in upper_hair), feature_max_y)
+
+    def test_explicit_eye_bone_suppresses_duplicate_head_face_features(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "explicit_eye_head.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            write_explicit_eye_head_fixture(model_path)
+
+            convert_model(
+                model_path,
+                output_path,
+                target_height=4.0,
+                complex_split=("head",),
+                report_path=report_path,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        elements = {element["name"]: element for element in data["elements"]}
+        self.assertIn("目.R_cube", elements)
+        self.assertIn("目.L_cube", elements)
+        self.assertFalse({"eye_l_cube", "eye_r_cube", "mouth_cube"} & set(elements))
+        self.assertFalse(any(name.startswith("head_core_front") and name.endswith("_face_cube") for name in elements))
+
+        subparts = {subpart["name"] for subpart in report["complex_split"][0]["subparts"]}
+        self.assertFalse({"eye_l", "eye_r", "mouth"} & subparts)
+        self.assertFalse(any(name.startswith("head_core_front") and name.endswith("_face") for name in subparts))
+
     def test_complex_split_merges_tiny_connected_components_to_nearest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = Path(temp_dir) / "head_tiny_component.gltf"
@@ -496,7 +583,7 @@ class ConvertModelTest(unittest.TestCase):
             {"hair_front_left", "hair_front_right"},
         )
 
-    def test_complex_split_projects_eye_and_mouth_cubes_outside_head_core(self) -> None:
+    def test_complex_split_keeps_face_feature_cubes_on_source_plane(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = Path(temp_dir) / "face_features.gltf"
             output_path = Path(temp_dir) / "model.bbmodel"
@@ -523,8 +610,12 @@ class ConvertModelTest(unittest.TestCase):
                 "nose_cube",
             },
         )
+        head_min_z = elements["head_core_cube"]["from"][2]
+        head_max_z = elements["head_core_cube"]["to"][2]
         for feature_name in ("brow_l_cube", "brow_r_cube", "eye_l_cube", "eye_r_cube", "mouth_cube", "nose_cube"):
-            self.assertLess(elements[feature_name]["to"][2], elements["head_core_cube"]["from"][2])
+            self.assertEqual(elements[feature_name]["from"][2], elements[feature_name]["to"][2])
+            self.assertGreaterEqual(elements[feature_name]["from"][2], head_min_z)
+            self.assertLessEqual(elements[feature_name]["to"][2], head_max_z)
 
     def test_complex_split_head_uses_vrm1_humanoid_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1206,6 +1297,113 @@ def write_large_head_core_fixture(path: Path) -> None:
         ],
         [{"name": "face skin"}],
     )
+    path.write_text(json.dumps(model), encoding="utf-8")
+
+
+def write_large_head_core_with_face_features_fixture(path: Path, include_front_hair: bool = False) -> None:
+    def repeated_triangle(points: list[tuple[float, float, float]], count: int) -> list[tuple[float, float, float]]:
+        result: list[tuple[float, float, float]] = []
+        for _ in range(count):
+            result.extend(points)
+        return result
+
+    specs = [
+        (repeated_triangle([(-1.2, 1.0, -1.0), (1.2, 1.0, -1.0), (-1.2, 1.3, -1.0)], 180), 0),
+        (repeated_triangle([(-1.2, 1.8, -1.0), (1.2, 1.8, -1.0), (-1.2, 2.1, -1.0)], 180), 0),
+        (repeated_triangle([(-1.0, 1.0, 1.0), (1.0, 1.0, 1.0), (0.0, 1.25, 1.0)], 180), 0),
+        (repeated_triangle([(-1.0, 1.45, 1.0), (1.0, 1.45, 1.0), (0.0, 1.75, 1.0)], 180), 0),
+        (repeated_triangle([(-1.0, 1.9, 1.0), (1.0, 1.9, 1.0), (0.0, 2.15, 1.0)], 180), 0),
+        ([(-0.55, 1.58, 1.05), (-0.3, 1.58, 1.05), (-0.425, 1.68, 1.05)], 1),
+        ([(0.3, 1.58, 1.05), (0.55, 1.58, 1.05), (0.425, 1.68, 1.05)], 1),
+        ([(-0.2, 1.32, 1.05), (0.2, 1.32, 1.05), (0.0, 1.38, 1.05)], 2),
+        ([(-0.6, 1.8, 1.05), (-0.25, 1.8, 1.05), (-0.425, 1.88, 1.05)], 3),
+        ([(0.25, 1.8, 1.05), (0.6, 1.8, 1.05), (0.425, 1.88, 1.05)], 3),
+    ]
+    materials = [
+        {"name": "face_skin"},
+        {"name": "eye material"},
+        {"name": "mouth material"},
+        {"name": "eyebrow material"},
+    ]
+    if include_front_hair:
+        specs.append((repeated_triangle([(-1.4, 1.1, 1.2), (1.4, 1.1, 1.2), (0.0, 1.6, 1.2)], 260), 4))
+        specs.append((repeated_triangle([(-1.4, 1.1, 1.25), (1.4, 2.45, 1.25), (1.2, 2.45, 1.25)], 260), 4))
+        materials.append({"name": "front hair"})
+
+    model = build_head_feature_model(specs, materials)
+    path.write_text(json.dumps(model), encoding="utf-8")
+
+
+def write_explicit_eye_head_fixture(path: Path) -> None:
+    def repeated_triangle(points: list[tuple[float, float, float]], count: int) -> list[tuple[float, float, float]]:
+        result: list[tuple[float, float, float]] = []
+        for _ in range(count):
+            result.extend(points)
+        return result
+
+    chunks: list[bytes] = []
+    buffer_views: list[dict[str, int]] = []
+    accessors: list[dict[str, int | str]] = []
+    primitives: list[dict[str, object]] = []
+    byte_offset = 0
+
+    def append_chunk(data: bytes) -> int:
+        nonlocal byte_offset
+        view_index = len(buffer_views)
+        buffer_views.append({"buffer": 0, "byteOffset": byte_offset, "byteLength": len(data)})
+        chunks.append(data)
+        byte_offset += len(data)
+        return view_index
+
+    def add_primitive(points: list[tuple[float, float, float]], joint: int, material: int) -> None:
+        positions = b"".join(struct.pack("<fff", *point) for point in points)
+        joints = bytes([joint, 0, 0, 0] * len(points))
+        weights = b"".join(struct.pack("<ffff", 1.0, 0.0, 0.0, 0.0) for _ in points)
+        position_accessor = len(accessors)
+        accessors.append({"bufferView": append_chunk(positions), "componentType": 5126, "count": len(points), "type": "VEC3"})
+        joints_accessor = len(accessors)
+        accessors.append({"bufferView": append_chunk(joints), "componentType": 5121, "count": len(points), "type": "VEC4"})
+        weights_accessor = len(accessors)
+        accessors.append({"bufferView": append_chunk(weights), "componentType": 5126, "count": len(points), "type": "VEC4"})
+        primitives.append(
+            {
+                "attributes": {"POSITION": position_accessor, "JOINTS_0": joints_accessor, "WEIGHTS_0": weights_accessor},
+                "material": material,
+                "mode": 4,
+            }
+        )
+
+    add_primitive(repeated_triangle([(-1.0, 1.0, -1.0), (1.0, 1.0, -1.0), (-1.0, 1.3, -1.0)], 180), 1, 0)
+    add_primitive(repeated_triangle([(-1.0, 1.9, -1.0), (1.0, 1.9, -1.0), (-1.0, 2.2, -1.0)], 180), 1, 0)
+    add_primitive(repeated_triangle([(-1.0, 1.0, 1.0), (1.0, 1.0, 1.0), (0.0, 1.25, 1.0)], 180), 1, 0)
+    add_primitive(repeated_triangle([(-1.0, 1.45, 1.0), (1.0, 1.45, 1.0), (0.0, 1.75, 1.0)], 180), 1, 0)
+    add_primitive(repeated_triangle([(-1.0, 1.9, 1.0), (1.0, 1.9, 1.0), (0.0, 2.15, 1.0)], 180), 1, 0)
+    add_primitive([(-0.55, 1.58, 1.05), (-0.3, 1.58, 1.05), (-0.425, 1.68, 1.05)], 1, 1)
+    add_primitive([(0.3, 1.58, 1.05), (0.55, 1.58, 1.05), (0.425, 1.68, 1.05)], 1, 1)
+    add_primitive([(-0.2, 1.32, 1.05), (0.2, 1.32, 1.05), (0.0, 1.38, 1.05)], 1, 2)
+    add_primitive([(-0.55, 1.58, 1.2), (-0.3, 1.58, 1.2), (-0.425, 1.68, 1.2)], 2, 1)
+    add_primitive([(0.3, 1.58, 1.2), (0.55, 1.58, 1.2), (0.425, 1.68, 1.2)], 3, 1)
+
+    payload_bytes = b"".join(chunks)
+    payload = base64.b64encode(payload_bytes).decode("ascii")
+    model = {
+        "asset": {"version": "2.0", "generator": "gltf2bb explicit eye head test"},
+        "scene": 0,
+        "scenes": [{"nodes": [4]}],
+        "nodes": [
+            {"name": "root_joint", "children": [1]},
+            {"name": "head", "translation": [0.0, 1.0, 0.0], "children": [2, 3]},
+            {"name": "目.R"},
+            {"name": "目.L"},
+            {"name": "mesh_node", "mesh": 0, "skin": 0},
+        ],
+        "skins": [{"joints": [0, 1, 2, 3]}],
+        "materials": [{"name": "face_skin"}, {"name": "eye material"}, {"name": "mouth material"}],
+        "meshes": [{"name": "explicit_eye_head", "primitives": primitives}],
+        "accessors": accessors,
+        "bufferViews": buffer_views,
+        "buffers": [{"byteLength": len(payload_bytes), "uri": f"data:application/octet-stream;base64,{payload}"}],
+    }
     path.write_text(json.dumps(model), encoding="utf-8")
 
 

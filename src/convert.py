@@ -696,6 +696,8 @@ def apply_head_complex_split(
         faces,
         config,
     )
+    explicit_face_feature_bbox = explicit_face_feature_accumulators_bbox(accumulators, owner_bone, owner_bbox)
+    suppress_material_face_features = explicit_face_feature_bbox is not None
     largest_component = tuple(component_indices[0]) if component_indices else ()
     report_accumulators: dict[str, BBoxAccumulator] = {}
     report_methods: dict[str, str] = {}
@@ -744,7 +746,8 @@ def apply_head_complex_split(
                 split_result = split_hair_part_faces(part_name, part_faces, owner_bbox)
                 merged_tiny_hair_buckets += split_result.merged_tiny_buckets
                 for split_part in split_result.parts:
-                    part_accumulator = add_to_part(unique_part_name(split_part.name, report_accumulators), method, split_part.faces)
+                    unique_name = unique_part_name(split_part.name, report_accumulators)
+                    part_accumulator = add_to_part(unique_name, method, split_part.faces)
                     if split_part.split_axes and expand_hair_bucket_accumulator(part_accumulator, split_part.split_axes):
                         expanded_hair_bucket_overlap += 1
 
@@ -776,6 +779,8 @@ def apply_head_complex_split(
 
         if material_faces:
             for material_part, part_faces in sorted(material_faces.items()):
+                if suppress_material_face_features and material_part in FACE_FEATURE_PART_PREFIXES:
+                    continue
                 if material_part == "hair":
                     hair_faces_by_part: dict[str, list[SplitFace]] = {}
                     for face in part_faces:
@@ -836,8 +841,6 @@ def apply_head_complex_split(
 
     flush_hair_parts()
     flush_accessory_parts()
-    project_face_feature_parts(owner_bone, accumulators, report_accumulators, owner_bbox)
-    project_side_feature_parts(owner_bone, accumulators, report_accumulators, owner_bbox)
     split_head_core_parts(
         owner_bone,
         head_core_faces,
@@ -1572,6 +1575,18 @@ def is_hair_part(name: str) -> bool:
     return name == "hair" or name.startswith("hair_")
 
 
+def is_head_core_part(name: str) -> bool:
+    return name == "head_core" or name.startswith("head_core_")
+
+
+def is_face_feature_name(name: str) -> bool:
+    haystack = name.casefold()
+    return any(
+        pattern.casefold() in haystack
+        for pattern in ("eye", "目", "瞳", "brow", "眉", "eyelash", "まつげ", "睫", "mouth", "口")
+    )
+
+
 def classify_eye_face(face: SplitFace, owner_bbox: tuple[list[float], list[float]]) -> str:
     return classify_lateral_feature_face(face, owner_bbox, "eye")
 
@@ -1846,84 +1861,42 @@ def unique_part_name(base_name: str, accumulators: dict[str, BBoxAccumulator]) -
     return f"{base_name}_{suffix}"
 
 
-def project_face_feature_parts(
-    owner_bone: int,
-    accumulators: dict[PartKey, BBoxAccumulator],
-    report_accumulators: dict[str, BBoxAccumulator],
-    owner_bbox: tuple[list[float], list[float]],
-) -> None:
-    feature_names = [name for name in report_accumulators if is_face_feature_part(name)]
-    if not feature_names:
-        return
-
-    surface_accumulator = report_accumulators.get("head_core")
-    if surface_accumulator is None or surface_accumulator.min_xyz is None or surface_accumulator.max_xyz is None:
-        surface_min, surface_max = owner_bbox
-    else:
-        surface_min, surface_max = surface_accumulator.min_xyz, surface_accumulator.max_xyz
-
-    feature_points = [
-        point
-        for name in feature_names
-        for point in report_accumulators[name].points_by_vertex.values()
-    ]
-    if not feature_points:
-        return
-
-    surface_center_z = (surface_min[2] + surface_max[2]) * 0.5
-    feature_center_z = points_centroid(feature_points)[2]
-    surface_depth = max(surface_max[2] - surface_min[2], owner_bbox[1][2] - owner_bbox[0][2], EPSILON)
-    thickness = max(surface_depth * 0.04, EPSILON)
-    if feature_center_z <= surface_center_z:
-        min_z = surface_min[2] - thickness
-        max_z = surface_min[2] - thickness * 0.1
-    else:
-        min_z = surface_max[2] + thickness * 0.1
-        max_z = surface_max[2] + thickness
-
-    for name in feature_names:
-        for accumulator in (report_accumulators.get(name), accumulators.get(PartKey(owner_bone, name))):
-            if accumulator is not None:
-                project_accumulator_z(accumulator, min_z, max_z)
-
-
 def is_face_feature_part(name: str) -> bool:
     return any(name == prefix or name.startswith(f"{prefix}_") for prefix in FACE_FEATURE_PART_PREFIXES)
 
 
-def project_side_feature_parts(
-    owner_bone: int,
+def explicit_face_feature_accumulators_bbox(
     accumulators: dict[PartKey, BBoxAccumulator],
-    report_accumulators: dict[str, BBoxAccumulator],
+    owner_bone: int,
     owner_bbox: tuple[list[float], list[float]],
-) -> None:
-    feature_names = [name for name in report_accumulators if is_side_feature_part(name)]
-    if not feature_names:
-        return
+) -> tuple[list[float], list[float]] | None:
+    feature_accumulators = [
+        accumulator
+        for part_key, accumulator in accumulators.items()
+        if part_key.owner_bone != owner_bone
+        and is_face_feature_name(part_key.name)
+        and accumulator.min_xyz is not None
+        and accumulator.max_xyz is not None
+        and accumulator_center_near_bbox(accumulator, owner_bbox)
+    ]
+    if not feature_accumulators:
+        return None
+    return combined_bbox(feature_accumulators)
 
-    surface_accumulator = report_accumulators.get("head_core")
-    if surface_accumulator is None or surface_accumulator.min_xyz is None or surface_accumulator.max_xyz is None:
-        surface_min, surface_max = owner_bbox
-    else:
-        surface_min, surface_max = surface_accumulator.min_xyz, surface_accumulator.max_xyz
 
-    surface_center_x = (surface_min[0] + surface_max[0]) * 0.5
-    surface_width = max(surface_max[0] - surface_min[0], owner_bbox[1][0] - owner_bbox[0][0], EPSILON)
-    thickness = max(surface_width * 0.04, EPSILON)
-    for name in feature_names:
-        accumulator = report_accumulators.get(name)
-        if accumulator is None:
-            continue
-        feature_center_x = points_centroid(list(accumulator.points_by_vertex.values()))[0]
-        if feature_center_x <= surface_center_x:
-            min_x = surface_min[0] - thickness
-            max_x = surface_min[0] - thickness * 0.1
-        else:
-            min_x = surface_max[0] + thickness * 0.1
-            max_x = surface_max[0] + thickness
-        for target in (accumulator, accumulators.get(PartKey(owner_bone, name))):
-            if target is not None:
-                project_accumulator_x(target, min_x, max_x)
+def accumulator_center_near_bbox(
+    accumulator: BBoxAccumulator,
+    bbox: tuple[list[float], list[float]],
+) -> bool:
+    if accumulator.min_xyz is None or accumulator.max_xyz is None:
+        return False
+    min_xyz, max_xyz = bbox
+    dimensions = bbox_dimensions(min_xyz, max_xyz)
+    center = [(accumulator.min_xyz[index] + accumulator.max_xyz[index]) * 0.5 for index in range(3)]
+    return all(
+        min_xyz[index] - dimensions[index] * 0.25 <= center[index] <= max_xyz[index] + dimensions[index] * 0.25
+        for index in range(3)
+    )
 
 
 def split_head_core_parts(
@@ -2022,26 +1995,6 @@ def merge_tiny_named_parts(
 
 def is_side_feature_part(name: str) -> bool:
     return any(name == prefix or name.startswith(f"{prefix}_") for prefix in SIDE_FEATURE_PART_PREFIXES)
-
-
-def project_accumulator_z(accumulator: BBoxAccumulator, min_z: float, max_z: float) -> None:
-    if accumulator.min_xyz is None or accumulator.max_xyz is None:
-        return
-    accumulator.min_xyz[2] = min(min_z, max_z)
-    accumulator.max_xyz[2] = max(min_z, max_z)
-    projected_z = (accumulator.min_xyz[2] + accumulator.max_xyz[2]) * 0.5
-    for point in accumulator.points_by_vertex.values():
-        point[2] = projected_z
-
-
-def project_accumulator_x(accumulator: BBoxAccumulator, min_x: float, max_x: float) -> None:
-    if accumulator.min_xyz is None or accumulator.max_xyz is None:
-        return
-    accumulator.min_xyz[0] = min(min_x, max_x)
-    accumulator.max_xyz[0] = max(min_x, max_x)
-    projected_x = (accumulator.min_xyz[0] + accumulator.max_xyz[0]) * 0.5
-    for point in accumulator.points_by_vertex.values():
-        point[0] = projected_x
 
 
 def classify_head_component_spatial(
@@ -2454,6 +2407,12 @@ def auto_orient_accumulator(
         return None
     if accumulator.min_xyz is None or accumulator.max_xyz is None:
         return None
+    if is_face_feature_name(part_key.name) or is_face_feature_name(bone.name):
+        return None
+    if accumulator.is_complex_split and (
+        is_head_core_part(part_key.name) or is_face_feature_part(part_key.name) or is_side_feature_part(part_key.name)
+    ):
+        return None
     if accumulator.is_complex_split and accumulator.faces < AUTO_ORIENT_MIN_FACES:
         return None
 
@@ -2524,7 +2483,7 @@ def auto_orient_candidate(
 
 
 def should_try_geometry_auto_orient(part_key: PartKey) -> bool:
-    return not (part_key.name == "head_core" or is_face_feature_part(part_key.name) or is_side_feature_part(part_key.name))
+    return not (is_head_core_part(part_key.name) or is_face_feature_part(part_key.name) or is_side_feature_part(part_key.name))
 
 
 def geometry_auto_orientation_matrices(
