@@ -412,6 +412,7 @@ class ConvertModelTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = Path(temp_dir) / "explicit_eye_front_hair.gltf"
             output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
             write_explicit_eye_head_fixture(model_path, include_front_hair=True)
 
             convert_model(
@@ -419,8 +420,10 @@ class ConvertModelTest(unittest.TestCase):
                 output_path,
                 target_height=4.0,
                 complex_split=("head",),
+                report_path=report_path,
             )
             data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
 
         elements = {element["name"]: element for element in data["elements"]}
         eye_elements = [element for name, element in elements.items() if name.startswith("目.")]
@@ -436,6 +439,52 @@ class ConvertModelTest(unittest.TestCase):
         self.assertTrue(all(element["to"][2] < eye_min_z for element in head_front_elements))
         self.assertLess(eye_min_z - max(element["to"][2] for element in head_front_elements), 0.05)
         self.assertTrue(all(element["from"][1] > eye_max_y for element in hair_front_elements))
+        protection_report = report["face_feature_protection"]
+        self.assertTrue(protection_report["enabled"])
+        self.assertEqual(protection_report["min_faces"], 32)
+        self.assertTrue(
+            any(action["action"] == "clamp_head_core_behind_features" for action in protection_report["actions"])
+        )
+        self.assertTrue(
+            any(action["action"] == "raise_hair_front_above_features" for action in protection_report["actions"])
+        )
+
+    def test_face_feature_protection_can_disable_front_hair_adjustment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "explicit_eye_front_hair.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            config_path = Path(temp_dir) / "config.json"
+            write_explicit_eye_head_fixture(model_path, include_front_hair=True)
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "complex_split": {"enabled": True, "bones": ["head"]},
+                        "face_feature_protection": {"protect_hair_front": False},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            convert_model(
+                model_path,
+                output_path,
+                target_height=4.0,
+                config_path=config_path,
+                report_path=report_path,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        elements = {element["name"]: element for element in data["elements"]}
+        eye_max_y = max(element["to"][1] for name, element in elements.items() if name.startswith("目."))
+        hair_front_elements = [element for name, element in elements.items() if name.startswith("hair_front")]
+
+        self.assertTrue(hair_front_elements)
+        self.assertTrue(any(element["from"][1] < eye_max_y for element in hair_front_elements))
+        protection_report = report["face_feature_protection"]
+        self.assertFalse(protection_report["protect_hair_front"])
+        self.assertFalse(any(action["action"] == "raise_hair_front_above_features" for action in protection_report["actions"]))
 
     def test_complex_split_merges_tiny_connected_components_to_nearest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -74,6 +74,16 @@ class UnskinnedMeshesConfig:
 
 
 @dataclass(frozen=True)
+class FaceFeatureProtectionConfig:
+    enabled: bool = True
+    min_faces: int = 32
+    margin_ratio: float = 0.002
+    outlier_gap_ratio: float = 0.05
+    protect_hair_front: bool = True
+    protect_head_core_front: bool = True
+
+
+@dataclass(frozen=True)
 class ProcessingConfig:
     preset: str = "default"
     bone_filter: BoneFilterConfig = field(default_factory=BoneFilterConfig)
@@ -82,6 +92,7 @@ class ProcessingConfig:
     oriented_cubes: OrientedCubesConfig = field(default_factory=OrientedCubesConfig)
     hybrid_detail_split: HybridDetailSplitConfig = field(default_factory=HybridDetailSplitConfig)
     unskinned_meshes: UnskinnedMeshesConfig = field(default_factory=UnskinnedMeshesConfig)
+    face_feature_protection: FaceFeatureProtectionConfig = field(default_factory=FaceFeatureProtectionConfig)
 
 
 UNSKINNED_MESH_STRATEGIES = {"node_parent", "nearest_bone", "node_parent_then_nearest"}
@@ -167,6 +178,7 @@ def merge_config_data(config: ProcessingConfig, data: dict[str, Any]) -> Process
     oriented_cubes = config.oriented_cubes
     hybrid_detail_split = config.hybrid_detail_split
     unskinned_meshes = config.unskinned_meshes
+    face_feature_protection = config.face_feature_protection
 
     raw_bone_filter = data.get("bone_filter")
     if isinstance(raw_bone_filter, dict):
@@ -210,6 +222,15 @@ def merge_config_data(config: ProcessingConfig, data: dict[str, Any]) -> Process
     elif raw_unskinned_meshes is not None:
         raise ConfigError("unskinned_meshes must be an object")
 
+    raw_face_feature_protection = data.get("face_feature_protection")
+    if isinstance(raw_face_feature_protection, dict):
+        face_feature_protection = merge_face_feature_protection_data(
+            face_feature_protection,
+            raw_face_feature_protection,
+        )
+    elif raw_face_feature_protection is not None:
+        raise ConfigError("face_feature_protection must be an object")
+
     return replace(
         config,
         bone_filter=bone_filter,
@@ -218,6 +239,7 @@ def merge_config_data(config: ProcessingConfig, data: dict[str, Any]) -> Process
         oriented_cubes=oriented_cubes,
         hybrid_detail_split=hybrid_detail_split,
         unskinned_meshes=unskinned_meshes,
+        face_feature_protection=face_feature_protection,
     )
 
 
@@ -389,6 +411,25 @@ def merge_unskinned_meshes_data(
         if not isinstance(data["case_sensitive"], bool):
             raise ConfigError("unskinned_meshes.case_sensitive must be a boolean")
         updates["case_sensitive"] = data["case_sensitive"]
+
+    return replace(config, **updates)
+
+
+def merge_face_feature_protection_data(
+    config: FaceFeatureProtectionConfig,
+    data: dict[str, Any],
+) -> FaceFeatureProtectionConfig:
+    updates: dict[str, Any] = {}
+    for key in ("enabled", "protect_hair_front", "protect_head_core_front"):
+        if key in data:
+            if not isinstance(data[key], bool):
+                raise ConfigError(f"face_feature_protection.{key} must be a boolean")
+            updates[key] = data[key]
+    if "min_faces" in data:
+        updates["min_faces"] = parse_non_negative_int(data["min_faces"], "face_feature_protection.min_faces")
+    for key in ("margin_ratio", "outlier_gap_ratio"):
+        if key in data:
+            updates[key] = parse_non_negative_number(data[key], f"face_feature_protection.{key}")
 
     return replace(config, **updates)
 

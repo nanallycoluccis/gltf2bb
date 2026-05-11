@@ -11,6 +11,7 @@ from typing import Any
 from .config import (
     CleanupConfig,
     ComplexSplitConfig,
+    FaceFeatureProtectionConfig,
     HybridDetailSplitConfig,
     OrientedCubesConfig,
     ProcessingConfig,
@@ -225,6 +226,17 @@ class OrientedCubeReport:
 
 
 @dataclass(frozen=True)
+class FaceFeatureProtectionAction:
+    owner_bone: int
+    owner_bone_name: str
+    cube_name: str
+    action: str
+    before_bbox: tuple[list[float], list[float]]
+    after_bbox: tuple[list[float], list[float]]
+    feature_bbox: tuple[list[float], list[float]]
+
+
+@dataclass(frozen=True)
 class HybridModeReport:
     enabled: bool = False
     special_cube_bones: tuple[str, ...] = ()
@@ -271,6 +283,8 @@ class ConvertResult:
     hybrid: HybridModeReport
     hybrid_detail_split: HybridDetailSplitConfig
     unskinned_meshes: UnskinnedMeshesConfig
+    face_feature_protection: FaceFeatureProtectionConfig
+    face_feature_protection_actions: list[FaceFeatureProtectionAction]
     assigned_unskinned_meshes: list[AssignedUnskinnedMesh]
     skipped_unskinned_meshes: list[SkippedUnskinnedMesh]
     warnings: list[str]
@@ -446,11 +460,24 @@ def convert_model(
                 split_faces,
             )
 
-    complex_split_report = apply_complex_split(split_faces, accumulators, config.complex_split, vrm_humanoid_nodes)
+    complex_split_report, face_feature_protection_actions = apply_complex_split(
+        split_faces,
+        accumulators,
+        config.complex_split,
+        config.face_feature_protection,
+        bones,
+        vrm_humanoid_nodes,
+    )
     complex_split_report.extend(
         apply_regular_detail_split(accumulators, regular_faces_by_part, bones, mode, config.hybrid_detail_split)
     )
-    apply_explicit_face_feature_visibility_protection(accumulators)
+    face_feature_protection_actions.extend(
+        apply_explicit_face_feature_visibility_protection(
+            accumulators,
+            bones,
+            config.face_feature_protection,
+        )
+    )
     complex_split_report.extend(apply_auto_spatial_split(accumulators, regular_faces_by_part, bones, mode))
     cleanup_report = apply_cleanup(accumulators, bones, config.cleanup, warnings, regular_faces_by_part)
     populated = {
@@ -497,6 +524,8 @@ def convert_model(
         hybrid=hybrid_report,
         hybrid_detail_split=config.hybrid_detail_split,
         unskinned_meshes=config.unskinned_meshes,
+        face_feature_protection=config.face_feature_protection,
+        face_feature_protection_actions=face_feature_protection_actions,
         assigned_unskinned_meshes=assigned_unskinned_meshes,
         skipped_unskinned_meshes=skipped_unskinned_meshes,
         warnings=warnings,
@@ -967,20 +996,32 @@ def apply_complex_split(
     split_faces: list[SplitFace],
     accumulators: dict[PartKey, BBoxAccumulator],
     config: ComplexSplitConfig,
+    face_feature_protection: FaceFeatureProtectionConfig,
+    bones: dict[int, BonePartition],
     vrm_humanoid_nodes: dict[str, set[int]],
-) -> list[ComplexSplitBoneReport]:
+) -> tuple[list[ComplexSplitBoneReport], list[FaceFeatureProtectionAction]]:
     faces_by_bone: dict[int, list[SplitFace]] = {}
     for face in split_faces:
         if face.points:
             faces_by_bone.setdefault(face.owner_bone, []).append(face)
 
     reports: list[ComplexSplitBoneReport] = []
+    protection_actions: list[FaceFeatureProtectionAction] = []
     for owner_bone, faces in sorted(faces_by_bone.items()):
         if is_head_complex_split_bone(owner_bone, faces[0].bone_name, config, vrm_humanoid_nodes):
-            reports.append(apply_head_complex_split(owner_bone, faces, accumulators, config))
+            report, actions = apply_head_complex_split(
+                owner_bone,
+                faces,
+                accumulators,
+                config,
+                face_feature_protection,
+                bones,
+            )
+            reports.append(report)
+            protection_actions.extend(actions)
         else:
             reports.append(apply_generic_complex_split(owner_bone, faces, accumulators, config))
-    return reports
+    return reports, protection_actions
 
 
 def is_head_complex_split_bone(
@@ -1004,7 +1045,9 @@ def apply_head_complex_split(
     faces: list[SplitFace],
     accumulators: dict[PartKey, BBoxAccumulator],
     config: ComplexSplitConfig,
-) -> ComplexSplitBoneReport:
+    face_feature_protection: FaceFeatureProtectionConfig,
+    bones: dict[int, BonePartition],
+) -> tuple[ComplexSplitBoneReport, list[FaceFeatureProtectionAction]]:
     owner_bbox = faces_bbox(faces)
     front_sign = infer_head_front_sign(faces, owner_bbox)
     if config.connected_components.enabled:
@@ -1017,13 +1060,22 @@ def apply_head_complex_split(
         faces,
         config,
     )
-    explicit_face_feature_bbox = explicit_face_feature_accumulators_bbox(accumulators, owner_bone, owner_bbox)
-    explicit_face_feature_protection_bbox = explicit_face_feature_visibility_bbox(
-        accumulators,
-        owner_bone,
-        owner_bbox,
-        front_sign,
-    ) or explicit_face_feature_bbox
+    explicit_face_feature_bbox = None
+    explicit_face_feature_protection_bbox = None
+    if face_feature_protection.enabled:
+        explicit_face_feature_bbox = explicit_face_feature_accumulators_bbox(
+            accumulators,
+            owner_bone,
+            owner_bbox,
+            face_feature_protection,
+        )
+        explicit_face_feature_protection_bbox = explicit_face_feature_visibility_bbox(
+            accumulators,
+            owner_bone,
+            owner_bbox,
+            front_sign,
+            face_feature_protection,
+        ) or explicit_face_feature_bbox
     suppress_material_face_features = explicit_face_feature_bbox is not None
     largest_component = tuple(component_indices[0]) if component_indices else ()
     report_accumulators: dict[str, BBoxAccumulator] = {}
@@ -1178,14 +1230,18 @@ def apply_head_complex_split(
         front_sign,
     )
     if explicit_face_feature_protection_bbox is not None:
-        protect_explicit_face_feature_visibility(
+        protection_actions = protect_explicit_face_feature_visibility(
             owner_bone,
             accumulators,
             report_accumulators,
             explicit_face_feature_protection_bbox,
             owner_bbox,
             front_sign,
+            face_feature_protection,
+            bones,
         )
+    else:
+        protection_actions = []
 
     subparts = [
         ComplexSplitSubpartReport(
@@ -1205,7 +1261,7 @@ def apply_head_complex_split(
         deleted_tiny_components=deleted_tiny_components,
         merged_tiny_hair_buckets=merged_tiny_hair_buckets,
         expanded_hair_bucket_overlap=expanded_hair_bucket_overlap,
-    )
+    ), protection_actions
 
 
 def apply_generic_complex_split(
@@ -2205,6 +2261,7 @@ def explicit_face_feature_accumulators_bbox(
     accumulators: dict[PartKey, BBoxAccumulator],
     owner_bone: int,
     owner_bbox: tuple[list[float], list[float]],
+    config: FaceFeatureProtectionConfig,
     *,
     significant_only: bool = False,
 ) -> tuple[list[float], list[float]] | None:
@@ -2212,6 +2269,7 @@ def explicit_face_feature_accumulators_bbox(
         accumulators,
         owner_bone,
         owner_bbox,
+        config,
         significant_only=significant_only,
     )
     if not feature_accumulators:
@@ -2224,16 +2282,19 @@ def explicit_face_feature_visibility_bbox(
     owner_bone: int,
     owner_bbox: tuple[list[float], list[float]],
     front_sign: int,
+    config: FaceFeatureProtectionConfig,
 ) -> tuple[list[float], list[float]] | None:
     feature_accumulators = explicit_face_feature_accumulators(
         accumulators,
         owner_bone,
         owner_bbox,
+        config,
         significant_only=True,
     ) or explicit_face_feature_accumulators(
         accumulators,
         owner_bone,
         owner_bbox,
+        config,
         significant_only=False,
     )
     if not feature_accumulators:
@@ -2249,9 +2310,15 @@ def explicit_face_feature_visibility_bbox(
         owner_min, owner_max = owner_bbox
         owner_depth = max(owner_max[2] - owner_min[2], EPSILON)
         if front_sign >= 0:
-            min_xyz[2] = max(min_xyz[2], feature_visibility_depth_value(depth_values, front_sign, owner_depth))
+            min_xyz[2] = max(
+                min_xyz[2],
+                feature_visibility_depth_value(depth_values, front_sign, owner_depth, config),
+            )
         else:
-            max_xyz[2] = min(max_xyz[2], feature_visibility_depth_value(depth_values, front_sign, owner_depth))
+            max_xyz[2] = min(
+                max_xyz[2],
+                feature_visibility_depth_value(depth_values, front_sign, owner_depth, config),
+            )
     return min_xyz, max_xyz
 
 
@@ -2259,6 +2326,7 @@ def explicit_face_feature_accumulators(
     accumulators: dict[PartKey, BBoxAccumulator],
     owner_bone: int,
     owner_bbox: tuple[list[float], list[float]],
+    config: FaceFeatureProtectionConfig,
     *,
     significant_only: bool,
 ) -> list[BBoxAccumulator]:
@@ -2270,17 +2338,22 @@ def explicit_face_feature_accumulators(
         and accumulator.min_xyz is not None
         and accumulator.max_xyz is not None
         and accumulator_center_near_bbox(accumulator, owner_bbox)
-        and (not significant_only or accumulator.faces >= FACE_FEATURE_PROTECTION_MIN_FACES)
+        and (not significant_only or accumulator.faces >= config.min_faces)
     ]
 
 
-def feature_visibility_depth_value(sorted_values: list[float], front_sign: int, owner_depth: float) -> float:
+def feature_visibility_depth_value(
+    sorted_values: list[float],
+    front_sign: int,
+    owner_depth: float,
+    config: FaceFeatureProtectionConfig,
+) -> float:
     if not sorted_values:
         return 0.0
     if len(sorted_values) < 3:
         return sorted_values[0] if front_sign >= 0 else sorted_values[-1]
 
-    gap_threshold = max(owner_depth * 0.05, MIN_CUBE_SIZE * 4.0)
+    gap_threshold = max(owner_depth * config.outlier_gap_ratio, MIN_CUBE_SIZE * 4.0)
     scan_count = max(1, int((len(sorted_values) - 1) * 0.35))
     if front_sign >= 0:
         best_index = 0
@@ -2379,12 +2452,17 @@ def protect_explicit_face_feature_visibility(
     feature_bbox: tuple[list[float], list[float]],
     owner_bbox: tuple[list[float], list[float]],
     front_sign: int,
-) -> None:
+    config: FaceFeatureProtectionConfig,
+    bones: dict[int, BonePartition],
+) -> list[FaceFeatureProtectionAction]:
     feature_min, feature_max = feature_bbox
     owner_min, owner_max = owner_bbox
     owner_dimensions = bbox_dimensions(owner_min, owner_max)
-    depth_margin = max(owner_dimensions[2] * FACE_FEATURE_PROTECTION_MARGIN_RATIO, EPSILON)
-    height_margin = max(owner_dimensions[1] * FACE_FEATURE_PROTECTION_MARGIN_RATIO, EPSILON)
+    depth_margin = max(owner_dimensions[2] * config.margin_ratio, EPSILON)
+    height_margin = max(owner_dimensions[1] * config.margin_ratio, EPSILON)
+    actions: list[FaceFeatureProtectionAction] = []
+    bone = bones.get(owner_bone)
+    owner_bone_name = bone.name if bone is not None else f"bone_{owner_bone}"
 
     for part_key, accumulator in list(accumulators.items()):
         if part_key.owner_bone != owner_bone:
@@ -2394,18 +2472,54 @@ def protect_explicit_face_feature_visibility(
 
         report_accumulator = report_accumulators.get(part_key.name) if report_accumulators is not None else None
         if part_key.name == "head_core" or part_key.name.startswith("head_core_front"):
+            if not config.protect_head_core_front:
+                continue
+            before_bbox = accumulator_bbox(accumulator)
             if clamp_front_axis_behind_features(accumulator, feature_min, feature_max, depth_margin, front_sign):
                 if report_accumulator is not None:
                     clamp_front_axis_behind_features(report_accumulator, feature_min, feature_max, depth_margin, front_sign)
+                actions.append(
+                    face_feature_protection_action(
+                        owner_bone,
+                        owner_bone_name,
+                        part_key.name,
+                        "clamp_head_core_behind_features",
+                        before_bbox,
+                        accumulator_bbox(accumulator),
+                        feature_bbox,
+                    )
+                )
             continue
 
         if part_key.name.startswith("hair_front") and accumulator_overlaps_bbox_axes(accumulator, feature_bbox, (0, 1)):
+            if not config.protect_hair_front:
+                continue
+            before_bbox = accumulator_bbox(accumulator)
             if clamp_hair_above_features(accumulator, feature_max[1] + height_margin):
                 if report_accumulator is not None:
                     clamp_hair_above_features(report_accumulator, feature_max[1] + height_margin)
+                actions.append(
+                    face_feature_protection_action(
+                        owner_bone,
+                        owner_bone_name,
+                        part_key.name,
+                        "raise_hair_front_above_features",
+                        before_bbox,
+                        accumulator_bbox(accumulator),
+                        feature_bbox,
+                    )
+                )
+    return actions
 
 
-def apply_explicit_face_feature_visibility_protection(accumulators: dict[PartKey, BBoxAccumulator]) -> None:
+def apply_explicit_face_feature_visibility_protection(
+    accumulators: dict[PartKey, BBoxAccumulator],
+    bones: dict[int, BonePartition],
+    config: FaceFeatureProtectionConfig,
+) -> list[FaceFeatureProtectionAction]:
+    if not config.enabled:
+        return []
+    actions: list[FaceFeatureProtectionAction] = []
     owner_bones = {
         part_key.owner_bone
         for part_key, accumulator in accumulators.items()
@@ -2424,7 +2538,7 @@ def apply_explicit_face_feature_visibility_protection(accumulators: dict[PartKey
         if not owner_accumulators:
             continue
         owner_bbox = combined_bbox(owner_accumulators)
-        raw_feature_bbox = explicit_face_feature_accumulators_bbox(accumulators, owner_bone, owner_bbox)
+        raw_feature_bbox = explicit_face_feature_accumulators_bbox(accumulators, owner_bone, owner_bbox, config)
         if raw_feature_bbox is None:
             continue
         front_sign = infer_face_feature_front_sign(owner_bbox, raw_feature_bbox)
@@ -2433,19 +2547,51 @@ def apply_explicit_face_feature_visibility_protection(accumulators: dict[PartKey
             owner_bone,
             owner_bbox,
             front_sign,
+            config,
         ) or raw_feature_bbox
-        protect_explicit_face_feature_visibility(
-            owner_bone,
-            accumulators,
-            None,
-            feature_bbox,
-            owner_bbox,
-            front_sign,
+        actions.extend(
+            protect_explicit_face_feature_visibility(
+                owner_bone,
+                accumulators,
+                None,
+                feature_bbox,
+                owner_bbox,
+                front_sign,
+                config,
+                bones,
+            )
         )
+    return actions
 
 
 def is_head_visibility_part_name(name: str) -> bool:
     return name == "head_core" or name.startswith("head_core_front") or name.startswith("hair_front")
+
+
+def accumulator_bbox(accumulator: BBoxAccumulator) -> tuple[list[float], list[float]]:
+    if accumulator.min_xyz is None or accumulator.max_xyz is None:
+        return [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+    return accumulator.min_xyz.copy(), accumulator.max_xyz.copy()
+
+
+def face_feature_protection_action(
+    owner_bone: int,
+    owner_bone_name: str,
+    part_name: str,
+    action: str,
+    before_bbox: tuple[list[float], list[float]],
+    after_bbox: tuple[list[float], list[float]],
+    feature_bbox: tuple[list[float], list[float]],
+) -> FaceFeatureProtectionAction:
+    return FaceFeatureProtectionAction(
+        owner_bone=owner_bone,
+        owner_bone_name=owner_bone_name,
+        cube_name=f"{part_name}_cube",
+        action=action,
+        before_bbox=(before_bbox[0].copy(), before_bbox[1].copy()),
+        after_bbox=(after_bbox[0].copy(), after_bbox[1].copy()),
+        feature_bbox=(feature_bbox[0].copy(), feature_bbox[1].copy()),
+    )
 
 
 def infer_face_feature_front_sign(
@@ -3645,6 +3791,10 @@ def convert_result_to_dict(result: ConvertResult) -> dict[str, Any]:
         "bone_resolution": bone_resolution_to_dict(result.bone_resolution),
         "hybrid": hybrid_to_dict(result.hybrid),
         "hybrid_detail_split": hybrid_detail_split_to_dict(result.hybrid_detail_split),
+        "face_feature_protection": face_feature_protection_to_dict(
+            result.face_feature_protection,
+            result.face_feature_protection_actions,
+        ),
         "unskinned_meshes": unskinned_meshes_to_dict(
             result.unskinned_meshes,
             result.assigned_unskinned_meshes,
@@ -3680,6 +3830,37 @@ def hybrid_detail_split_to_dict(item: HybridDetailSplitConfig) -> dict[str, Any]
         "min_component_faces": item.min_component_faces,
         "min_component_ratio": item.min_component_ratio,
     }
+
+
+def face_feature_protection_to_dict(
+    config: FaceFeatureProtectionConfig,
+    actions: list[FaceFeatureProtectionAction],
+) -> dict[str, Any]:
+    return {
+        "enabled": config.enabled,
+        "min_faces": config.min_faces,
+        "margin_ratio": config.margin_ratio,
+        "outlier_gap_ratio": config.outlier_gap_ratio,
+        "protect_hair_front": config.protect_hair_front,
+        "protect_head_core_front": config.protect_head_core_front,
+        "actions": [face_feature_protection_action_to_dict(action) for action in actions],
+    }
+
+
+def face_feature_protection_action_to_dict(item: FaceFeatureProtectionAction) -> dict[str, Any]:
+    return {
+        "owner_bone": item.owner_bone,
+        "owner_bone_name": item.owner_bone_name,
+        "cube_name": item.cube_name,
+        "action": item.action,
+        "before_bbox": bbox_to_dict(item.before_bbox),
+        "after_bbox": bbox_to_dict(item.after_bbox),
+        "feature_bbox": bbox_to_dict(item.feature_bbox),
+    }
+
+
+def bbox_to_dict(bbox: tuple[list[float], list[float]]) -> dict[str, Any]:
+    return {"min": rounded_vec(bbox[0]), "max": rounded_vec(bbox[1])}
 
 
 def unskinned_meshes_to_dict(
