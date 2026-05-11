@@ -7,7 +7,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.convert import convert_model
+from src.config import FaceFeatureProtectionConfig
+from src.convert import convert_model, protect_explicit_face_feature_visibility, split_hair_part_faces
+from src.conversion.types import BBoxAccumulator, PartKey, SplitFace
 from src.inspect import main
 
 
@@ -437,13 +439,14 @@ class ConvertModelTest(unittest.TestCase):
         eye_min_z = min(element["from"][2] for element in eye_elements)
         eye_max_y = max(element["to"][1] for element in eye_elements)
         self.assertTrue(all(element["to"][2] < eye_min_z for element in head_front_elements))
-        self.assertLess(eye_min_z - max(element["to"][2] for element in head_front_elements), 0.05)
+        self.assertIn("head_core_front_lower_cube", elements)
+        self.assertNotIn("head_core_front_lower_left_cube", elements)
         self.assertTrue(all(element["from"][1] > eye_max_y for element in hair_front_elements))
         protection_report = report["face_feature_protection"]
         self.assertTrue(protection_report["enabled"])
         self.assertEqual(protection_report["min_faces"], 32)
-        self.assertTrue(
-            any(action["action"] == "clamp_head_core_behind_features" for action in protection_report["actions"])
+        self.assertFalse(
+            any(action["action"] == "split_head_core_around_features" for action in protection_report["actions"])
         )
         self.assertTrue(
             any(action["action"] == "raise_hair_front_above_features" for action in protection_report["actions"])
@@ -485,6 +488,51 @@ class ConvertModelTest(unittest.TestCase):
         protection_report = report["face_feature_protection"]
         self.assertFalse(protection_report["protect_hair_front"])
         self.assertFalse(any(action["action"] == "raise_hair_front_above_features" for action in protection_report["actions"]))
+
+    def test_explicit_face_features_do_not_expand_head_core_toward_face(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "explicit_eye_head.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            write_explicit_eye_head_fixture(model_path)
+
+            convert_model(
+                model_path,
+                output_path,
+                target_height=4.0,
+                complex_split=("head",),
+                report_path=report_path,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        elements = {element["name"]: element for element in data["elements"]}
+        eye_min_z = min(element["from"][2] for name, element in elements.items() if name.startswith("目."))
+        head_front_elements = [element for name, element in elements.items() if name.startswith("head_core_front")]
+
+        self.assertTrue(head_front_elements)
+        self.assertTrue(all(element["to"][2] < eye_min_z for element in head_front_elements))
+        self.assertFalse(
+            any(action["action"] == "clamp_head_core_behind_features" for action in report["face_feature_protection"]["actions"])
+        )
+
+    def test_face_feature_protection_clamps_back_head_core_bucket_that_reaches_face(self) -> None:
+        accumulator = BBoxAccumulator(min_xyz=[-1.0, 0.0, -0.5], max_xyz=[1.0, 1.0, 1.4], faces=10)
+        accumulators = {PartKey(1, "head_core_back_lower"): accumulator}
+
+        actions = protect_explicit_face_feature_visibility(
+            1,
+            accumulators,
+            None,
+            ([-0.5, 0.2, 1.0], [0.5, 0.8, 1.2]),
+            ([-1.0, 0.0, -0.5], [1.0, 1.0, 1.4]),
+            1,
+            FaceFeatureProtectionConfig(),
+            {},
+        )
+
+        self.assertEqual([action.action for action in actions], ["clamp_head_core_behind_features"])
+        self.assertLess(accumulator.max_xyz[2], 1.0)
 
     def test_complex_split_merges_tiny_connected_components_to_nearest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -701,6 +749,32 @@ class ConvertModelTest(unittest.TestCase):
         self.assertFalse(report["hybrid_detail_split"]["by_material"])
         self.assertFalse(report["hybrid_detail_split"]["by_connected_component"])
 
+    def test_hybrid_detail_split_spatially_splits_compact_single_material_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "spatial_detail.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            write_spatial_detail_fixture(model_path)
+
+            result = convert_model(
+                model_path,
+                output_path,
+                mode="hybrid",
+                target_height=12.0,
+                report_path=report_path,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        element_names = {element["name"] for element in data["elements"]}
+        detail_names = {name for name in element_names if name.startswith("detail_part_")}
+        self.assertGreaterEqual(len(detail_names), 2)
+        self.assertNotIn("detail_part_cube", element_names)
+        self.assertGreater(len(result.cubes), 2)
+
+        detail_split = next(item for item in report["complex_split"] if item["bone_name"] == "detail_part")
+        self.assertEqual({subpart["method"] for subpart in detail_split["subparts"]}, {"regular_spatial_detail"})
+
     def test_head_hair_continuity_merges_tiny_middle_bucket_and_expands_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = Path(temp_dir) / "hair_continuity.gltf"
@@ -729,6 +803,67 @@ class ConvertModelTest(unittest.TestCase):
             {subpart["name"] for subpart in head_split["subparts"]},
             {"hair_front_left", "hair_front_right"},
         )
+
+    def test_head_hair_split_uses_depth_buckets_for_deep_hair_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "deep_head_hair.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            write_deep_head_hair_fixture(model_path)
+
+            convert_model(
+                model_path,
+                output_path,
+                target_height=4.0,
+                complex_split=("head",),
+                report_path=report_path,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        element_names = {element["name"] for element in data["elements"]}
+        self.assertTrue(any(name.startswith("hair_back") and "front_cube" in name for name in element_names))
+        self.assertTrue(any(name.startswith("hair_back") and "back_cube" in name for name in element_names))
+
+        subparts = {subpart["name"] for subpart in report["complex_split"][0]["subparts"]}
+        self.assertTrue(any(name.startswith("hair_back") and "front" in name for name in subparts))
+        self.assertTrue(any(name.startswith("hair_back") and "back" in name for name in subparts))
+
+    def test_large_head_hair_bucket_refines_into_smaller_spatial_parts(self) -> None:
+        faces: list[SplitFace] = []
+        vertex_index = 0
+        for x_index in range(5):
+            for z_index in range(5):
+                center_x = -1.6 + x_index * 0.8
+                center_z = -1.6 + z_index * 0.8
+                center_y = 1.4 + ((x_index + z_index) % 3) * 0.05
+                for _repeat in range(100):
+                    vertex_keys = [("rounded_hair", vertex_index + offset) for offset in range(3)]
+                    vertex_index += 3
+                    faces.append(
+                        SplitFace(
+                            owner_bone=1,
+                            bone_name="head",
+                            points=[
+                                [center_x - 0.08, center_y, center_z],
+                                [center_x + 0.08, center_y, center_z],
+                                [center_x, center_y + 0.08, center_z + 0.08],
+                            ],
+                            vertex_keys=vertex_keys,
+                            material_name="back hair",
+                        )
+                    )
+
+        result = split_hair_part_faces(
+            "hair_back_mid_left_back_upper",
+            faces,
+            ([-2.0, 0.0, -2.0], [2.0, 10.0, 2.0]),
+        )
+
+        self.assertGreaterEqual(len(result.parts), 4)
+        self.assertTrue(all(len(part.faces) < len(faces) for part in result.parts))
+        self.assertTrue(any(part.name.endswith("_left_front") for part in result.parts))
+        self.assertTrue(any(part.name.endswith("_right_back") for part in result.parts))
 
     def test_complex_split_keeps_face_feature_cubes_on_source_plane(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1561,7 +1696,11 @@ def write_large_head_core_with_face_features_fixture(path: Path, include_front_h
     path.write_text(json.dumps(model), encoding="utf-8")
 
 
-def write_explicit_eye_head_fixture(path: Path, include_front_hair: bool = False) -> None:
+def write_explicit_eye_head_fixture(
+    path: Path,
+    include_front_hair: bool = False,
+    include_back_hair: bool = False,
+) -> None:
     def repeated_triangle(points: list[tuple[float, float, float]], count: int) -> list[tuple[float, float, float]]:
         result: list[tuple[float, float, float]] = []
         for _ in range(count):
@@ -1612,6 +1751,13 @@ def write_explicit_eye_head_fixture(path: Path, include_front_hair: bool = False
     add_primitive([(0.3, 1.58, 1.2), (0.55, 1.58, 1.2), (0.425, 1.68, 1.2)], 3, 1)
     if include_front_hair:
         add_primitive(repeated_triangle([(-1.2, 1.2, 1.25), (1.2, 1.2, 1.25), (0.0, 2.45, 1.25)], 260), 1, 3)
+    if include_back_hair:
+        back_hair_material = 4 if include_front_hair else 3
+        add_primitive(
+            repeated_triangle([(-1.2, 1.2, 1.25), (1.2, 1.2, 1.25), (0.0, 2.45, 1.25)], 260),
+            1,
+            back_hair_material,
+        )
 
     payload_bytes = b"".join(chunks)
     payload = base64.b64encode(payload_bytes).decode("ascii")
@@ -1632,6 +1778,7 @@ def write_explicit_eye_head_fixture(path: Path, include_front_hair: bool = False
             {"name": "eye material"},
             {"name": "mouth material"},
             *([{"name": "front hair"}] if include_front_hair else []),
+            *([{"name": "back hair"}] if include_back_hair else []),
         ],
         "meshes": [{"name": "explicit_eye_head", "primitives": primitives}],
         "accessors": accessors,
@@ -1831,6 +1978,91 @@ def write_hair_continuity_fixture(path: Path) -> None:
     path.write_text(json.dumps(model), encoding="utf-8")
 
 
+def write_deep_head_hair_fixture(path: Path) -> None:
+    points = [
+        (-0.5, 1.0, 0.0),
+        (0.5, 1.0, 0.0),
+        (-0.5, 2.0, 0.0),
+        (-0.3, 1.2, -1.0),
+        (0.3, 1.2, -1.0),
+        (-0.3, 2.1, -1.0),
+        (0.3, 2.1, -1.0),
+        (-0.3, 1.2, 1.0),
+        (0.3, 1.2, 1.0),
+        (-0.3, 2.1, 1.0),
+        (0.3, 2.1, 1.0),
+    ]
+    front_faces = [3, 4, 5, 4, 6, 5]
+    back_faces = [7, 9, 8, 8, 9, 10]
+    side_faces = [3, 5, 7, 7, 5, 9, 4, 8, 6, 8, 10, 6]
+    indices = [0, 1, 2] + (front_faces + back_faces + side_faces) * 4
+    positions = b"".join(struct.pack("<fff", *point) for point in points)
+    joints = bytes([1, 0, 0, 0] * len(points))
+    weights = b"".join(struct.pack("<ffff", 1.0, 0.0, 0.0, 0.0) for _ in points)
+    index_bytes = b"".join(struct.pack("<H", index) for index in indices)
+    payload = base64.b64encode(positions + joints + weights + index_bytes).decode("ascii")
+    model = {
+        "asset": {"version": "2.0", "generator": "gltf2bb deep hair split test"},
+        "scene": 0,
+        "scenes": [{"nodes": [2]}],
+        "nodes": [
+            {"name": "root_joint", "children": [1]},
+            {"name": "head", "translation": [0.0, 1.0, 0.0]},
+            {"name": "mesh_node", "mesh": 0, "skin": 0},
+        ],
+        "skins": [{"joints": [0, 1]}],
+        "materials": [{"name": "face_skin"}, {"name": "back hair"}],
+        "meshes": [
+            {
+                "name": "deep_head_hair",
+                "primitives": [
+                    {
+                        "attributes": {"POSITION": 0, "JOINTS_0": 1, "WEIGHTS_0": 2},
+                        "indices": 3,
+                        "material": 0,
+                        "mode": 4,
+                    },
+                    {
+                        "attributes": {"POSITION": 0, "JOINTS_0": 1, "WEIGHTS_0": 2},
+                        "indices": 4,
+                        "material": 1,
+                        "mode": 4,
+                    },
+                ],
+            }
+        ],
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": len(points), "type": "VEC3"},
+            {"bufferView": 1, "componentType": 5121, "count": len(points), "type": "VEC4"},
+            {"bufferView": 2, "componentType": 5126, "count": len(points), "type": "VEC4"},
+            {"bufferView": 3, "componentType": 5123, "count": 3, "type": "SCALAR"},
+            {"bufferView": 4, "componentType": 5123, "count": len(indices) - 3, "type": "SCALAR"},
+        ],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": len(positions)},
+            {"buffer": 0, "byteOffset": len(positions), "byteLength": len(joints)},
+            {"buffer": 0, "byteOffset": len(positions) + len(joints), "byteLength": len(weights)},
+            {
+                "buffer": 0,
+                "byteOffset": len(positions) + len(joints) + len(weights),
+                "byteLength": 6,
+            },
+            {
+                "buffer": 0,
+                "byteOffset": len(positions) + len(joints) + len(weights) + 6,
+                "byteLength": len(index_bytes) - 6,
+            },
+        ],
+        "buffers": [
+            {
+                "byteLength": len(positions) + len(joints) + len(weights) + len(index_bytes),
+                "uri": f"data:application/octet-stream;base64,{payload}",
+            }
+        ],
+    }
+    path.write_text(json.dumps(model), encoding="utf-8")
+
+
 def write_oversized_back_panel_fixture(path: Path) -> None:
     points: list[tuple[float, float, float]] = []
     x_segments = 8
@@ -1954,6 +2186,70 @@ def write_material_detail_foot_fixture(path: Path) -> None:
         "skins": [{"joints": [0, 1]}],
         "materials": [{"name": "body"}, {"name": "skin"}, {"name": "shoe"}, {"name": "heel"}],
         "meshes": [{"name": "material_detail_foot", "primitives": primitives}],
+        "accessors": accessors,
+        "bufferViews": buffer_views,
+        "buffers": [{"byteLength": len(payload_bytes), "uri": f"data:application/octet-stream;base64,{payload}"}],
+    }
+    path.write_text(json.dumps(model), encoding="utf-8")
+
+
+def write_spatial_detail_fixture(path: Path) -> None:
+    chunks: list[bytes] = []
+    buffer_views: list[dict[str, int]] = []
+    accessors: list[dict[str, int | str]] = []
+    primitives: list[dict[str, object]] = []
+    byte_offset = 0
+
+    def append_chunk(data: bytes) -> int:
+        nonlocal byte_offset
+        view_index = len(buffer_views)
+        buffer_views.append({"buffer": 0, "byteOffset": byte_offset, "byteLength": len(data)})
+        chunks.append(data)
+        byte_offset += len(data)
+        return view_index
+
+    def repeated_triangle(points: list[tuple[float, float, float]], count: int) -> list[tuple[float, float, float]]:
+        result: list[tuple[float, float, float]] = []
+        for _ in range(count):
+            result.extend(points)
+        return result
+
+    def add_primitive(points: list[tuple[float, float, float]], joint: int, material: int) -> None:
+        positions = b"".join(struct.pack("<fff", *point) for point in points)
+        joints = bytes([joint, 0, 0, 0] * len(points))
+        weights = b"".join(struct.pack("<ffff", 1.0, 0.0, 0.0, 0.0) for _ in points)
+        position_accessor = len(accessors)
+        accessors.append({"bufferView": append_chunk(positions), "componentType": 5126, "count": len(points), "type": "VEC3"})
+        joints_accessor = len(accessors)
+        accessors.append({"bufferView": append_chunk(joints), "componentType": 5121, "count": len(points), "type": "VEC4"})
+        weights_accessor = len(accessors)
+        accessors.append({"bufferView": append_chunk(weights), "componentType": 5126, "count": len(points), "type": "VEC4"})
+        primitives.append(
+            {
+                "attributes": {"POSITION": position_accessor, "JOINTS_0": joints_accessor, "WEIGHTS_0": weights_accessor},
+                "material": material,
+                "mode": 4,
+            }
+        )
+
+    add_primitive(repeated_triangle([(-0.3, 0.0, 0.0), (0.3, 0.0, 0.0), (0.0, 12.0, 0.0)], 2), 0, 0)
+    add_primitive(repeated_triangle([(-0.9, 10.2, 0.8), (-0.25, 10.2, 1.4), (-0.55, 11.0, 1.0)], 120), 1, 1)
+    add_primitive(repeated_triangle([(0.25, 10.2, 1.4), (0.9, 10.2, 0.8), (0.55, 11.0, 1.0)], 120), 1, 1)
+
+    payload_bytes = b"".join(chunks)
+    payload = base64.b64encode(payload_bytes).decode("ascii")
+    model = {
+        "asset": {"version": "2.0", "generator": "gltf2bb spatial detail split test"},
+        "scene": 0,
+        "scenes": [{"nodes": [2]}],
+        "nodes": [
+            {"name": "body", "children": [1]},
+            {"name": "detail_part"},
+            {"name": "mesh_node", "mesh": 0, "skin": 0},
+        ],
+        "skins": [{"joints": [0, 1]}],
+        "materials": [{"name": "body"}, {"name": "opaque_detail"}],
+        "meshes": [{"name": "spatial_detail", "primitives": primitives}],
         "accessors": accessors,
         "bufferViews": buffer_views,
         "buffers": [{"byteLength": len(payload_bytes), "uri": f"data:application/octet-stream;base64,{payload}"}],

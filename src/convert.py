@@ -103,6 +103,14 @@ HEAD_DETAIL_AUTO_ORIENT_MIN_VOLUME_REDUCTION = 0.03
 HEAD_ACCESSORY_SPLIT_MIN_FACES = 24
 HEAD_CORE_SPLIT_MIN_FACES = 800
 HEAD_CORE_SPLIT_MIN_BUCKET_FACES = 64
+HEAD_HAIR_REFINEMENT_MIN_FACES = 1200
+HEAD_HAIR_REFINEMENT_MIN_BUCKET_FACES = 400
+HEAD_HAIR_REFINEMENT_TARGET_FACES = 900
+HEAD_HAIR_REFINEMENT_MIN_AXIS_RATIO = 0.32
+HEAD_HAIR_REFINEMENT_MAX_AXES = 3
+REGULAR_SPATIAL_DETAIL_MIN_FACES = 200
+REGULAR_SPATIAL_DETAIL_AXIS_RATIO = 0.40
+REGULAR_SPATIAL_DETAIL_MAX_AXES = 2
 HAIR_BUCKET_MIN_FACES = 4
 HAIR_BUCKET_MIN_FACE_RATIO = 0.08
 HAIR_BUCKET_OVERLAP_RATIO = 0.015
@@ -125,7 +133,27 @@ HEAD_MATERIAL_PATTERNS = {
     "mouth": ("mouth", "teeth", "tongue", "口", "嘴", "唇", "舌", "牙"),
     "nose": ("nose", "鼻"),
     "ear": ("ear", "耳"),
-    "head_accessory": ("ribbon", "accessory", "hat", "リボン", "头饰", "頭飾", "头带", "頭帶", "饰", "飾"),
+    "head_accessory": (
+        "ribbon",
+        "accessory",
+        "hat",
+        "glasses",
+        "goggle",
+        "eyewear",
+        "リボン",
+        "メガネ",
+        "ゴーグル",
+        "眼鏡",
+        "眼镜",
+        "护目镜",
+        "護目鏡",
+        "头饰",
+        "頭飾",
+        "头带",
+        "頭帶",
+        "饰",
+        "飾",
+    ),
     "head_core": ("face", "skin", "head", "顔", "肌", "脸", "臉", "皮肤", "皮膚"),
 }
 FACE_FEATURE_PART_PREFIXES = ("eye", "mouth", "brow", "eyelash", "nose")
@@ -964,7 +992,7 @@ def apply_head_complex_split(
                 hair_chunks = [(merged_method, merged_faces)]
 
             for method, part_faces in hair_chunks:
-                split_result = split_hair_part_faces(part_name, part_faces, owner_bbox)
+                split_result = split_hair_part_faces(part_name, part_faces, owner_bbox, front_sign)
                 merged_tiny_hair_buckets += split_result.merged_tiny_buckets
                 for split_part in split_result.parts:
                     unique_name = unique_part_name(split_part.name, report_accumulators)
@@ -1062,6 +1090,11 @@ def apply_head_complex_split(
 
     flush_hair_parts()
     flush_accessory_parts()
+    head_core_front_sign = (
+        infer_face_feature_front_sign(owner_bbox, explicit_face_feature_bbox)
+        if explicit_face_feature_bbox is not None
+        else front_sign
+    )
     split_head_core_parts(
         owner_bone,
         head_core_faces,
@@ -1069,7 +1102,7 @@ def apply_head_complex_split(
         report_accumulators,
         report_methods,
         owner_bbox,
-        front_sign,
+        head_core_front_sign,
     )
     if explicit_face_feature_protection_bbox is not None:
         protection_actions = protect_explicit_face_feature_visibility(
@@ -1078,7 +1111,7 @@ def apply_head_complex_split(
             report_accumulators,
             explicit_face_feature_protection_bbox,
             owner_bbox,
-            front_sign,
+            head_core_front_sign,
             face_feature_protection,
             bones,
         )
@@ -1307,6 +1340,7 @@ def regular_detail_split_specs(
     faces: list[SplitFace],
     detail_split: HybridDetailSplitConfig,
 ) -> list[tuple[str, str, list[SplitFace]]]:
+    sanitized_name = sanitize_part_name(part_name)
     material_specs = regular_material_split_specs(part_name, faces, detail_split) if detail_split.by_material else []
     if len(material_specs) >= 2:
         result: list[tuple[str, str, list[SplitFace]]] = []
@@ -1323,21 +1357,31 @@ def regular_detail_split_specs(
             else:
                 result.append((material_name, "regular_material", material_faces))
         return result
-    if not detail_split.by_connected_component or not should_split_single_material_components(part_name, faces):
-        return [(sanitize_part_name(part_name), "regular_detail", faces)]
-    return split_regular_faces_by_components(
-        sanitize_part_name(part_name),
-        faces,
-        "regular_connected_component",
-        detail_split,
-    )
+    if not detail_split.by_connected_component:
+        return [(sanitized_name, "regular_detail", faces)]
+
+    component_specs: list[tuple[str, str, list[SplitFace]]] = []
+    if should_split_single_material_components(part_name, faces):
+        component_specs = split_regular_faces_by_components(
+            sanitized_name,
+            faces,
+            "regular_connected_component",
+            detail_split,
+        )
+        if len(component_specs) >= 2:
+            return refine_regular_component_specs_by_spatial_detail(component_specs, detail_split)
+
+    spatial_specs = split_regular_faces_by_spatial_detail(sanitized_name, faces, detail_split)
+    if len(spatial_specs) >= 2:
+        return spatial_specs
+    return component_specs or [(sanitized_name, "regular_detail", faces)]
 
 
 def should_split_single_material_components(part_name: str, faces: list[SplitFace]) -> bool:
     if any(matches_complex_alias(part_name, alias) for alias in ("hair", "skirt", "coat", "accessory")):
         return True
     material_part = classify_generic_material(faces)
-    return material_part in {"hair", "head_accessory"}
+    return material_part in {"hair", "head_accessory", "ear"}
 
 
 def regular_material_split_specs(
@@ -1406,6 +1450,58 @@ def split_regular_faces_by_components(
     if remainder:
         specs.append((f"{base_name}_misc", method, remainder))
     return specs
+
+
+def refine_regular_component_specs_by_spatial_detail(
+    specs: list[tuple[str, str, list[SplitFace]]],
+    detail_split: HybridDetailSplitConfig,
+) -> list[tuple[str, str, list[SplitFace]]]:
+    refined: list[tuple[str, str, list[SplitFace]]] = []
+    for base_name, method, faces in specs:
+        spatial_specs = split_regular_faces_by_spatial_detail(base_name, faces, detail_split)
+        if len(spatial_specs) >= 2:
+            refined.extend(spatial_specs)
+        else:
+            refined.append((base_name, method, faces))
+    return refined
+
+
+def split_regular_faces_by_spatial_detail(
+    base_name: str,
+    faces: list[SplitFace],
+    detail_split: HybridDetailSplitConfig,
+) -> list[tuple[str, str, list[SplitFace]]]:
+    if len(faces) < max(REGULAR_SPATIAL_DETAIL_MIN_FACES, detail_split.min_faces):
+        return [(base_name, "regular_detail", faces)]
+
+    part_min, part_max = faces_bbox(faces)
+    dimensions = bbox_dimensions(part_min, part_max)
+    longest = max(dimensions) if dimensions else 0.0
+    if longest <= EPSILON:
+        return [(base_name, "regular_detail", faces)]
+
+    axes = [
+        axis
+        for axis in sorted(range(3), key=lambda item: dimensions[item], reverse=True)
+        if dimensions[axis] >= longest * REGULAR_SPATIAL_DETAIL_AXIS_RATIO
+    ]
+    if len(axes) < 2:
+        return [(base_name, "regular_detail", faces)]
+
+    min_bucket_faces = max(
+        detail_split.min_component_faces,
+        math.ceil(len(faces) * detail_split.min_component_ratio),
+    )
+    parts: list[tuple[str, list[SplitFace]]] = [(base_name, faces)]
+    for axis in axes[:REGULAR_SPATIAL_DETAIL_MAX_AXES]:
+        split_parts = split_faces_by_axis(parts, axis, 2, axis_suffixes(axis, 2))
+        split_parts, _merged = merge_tiny_named_parts(split_parts, min_bucket_faces)
+        if len(split_parts) > len(parts):
+            parts = split_parts
+
+    if len(parts) < 2:
+        return [(base_name, "regular_detail", faces)]
+    return [(name, "regular_spatial_detail", part_faces) for name, part_faces in parts]
 
 
 def apply_auto_spatial_split(
@@ -1896,6 +1992,7 @@ def split_hair_part_faces(
     part_name: str,
     faces: list[SplitFace],
     owner_bbox: tuple[list[float], list[float]],
+    front_sign: int = DEFAULT_HEAD_FRONT_SIGN,
 ) -> HairSplitResult:
     if len(faces) < 2:
         return HairSplitResult(parts=[HairSplitPart(part_name, faces)])
@@ -1903,7 +2000,9 @@ def split_hair_part_faces(
     part_min, part_max = faces_bbox(faces)
     owner_min, owner_max = owner_bbox
     part_width = part_max[0] - part_min[0]
+    part_depth = part_max[2] - part_min[2]
     owner_width = owner_max[0] - owner_min[0]
+    owner_depth = owner_max[2] - owner_min[2]
     part_height = part_max[1] - part_min[1]
     owner_height = owner_max[1] - owner_min[1]
 
@@ -1915,8 +2014,14 @@ def split_hair_part_faces(
             parts = split_hair_parts_by_axis(parts, axis=0, segment_count=segment_count, suffixes=horizontal_suffixes(segment_count))
             parts, merged = merge_tiny_hair_face_parts(parts, owner_bbox)
             merged_tiny_buckets += merged
+        min_depth_for_split = max(owner_depth * 0.45, max(part_width, part_height) * 0.25)
+        if part_depth > EPSILON and owner_depth > EPSILON and part_depth >= min_depth_for_split:
+            parts = split_hair_parts_by_axis(parts, axis=2, segment_count=2, suffixes=head_core_depth_suffixes(front_sign))
+            parts, merged = merge_tiny_hair_face_parts(parts, owner_bbox)
+            merged_tiny_buckets += merged
 
     if len(faces) < 250 or part_height <= EPSILON or owner_height <= EPSILON or part_height < owner_height * 0.3:
+        parts = refine_large_hair_split_parts(parts, owner_bbox)
         return HairSplitResult(parts=parts, merged_tiny_buckets=merged_tiny_buckets)
 
     segment_count = max(math.ceil(part_height / (owner_height * 0.3)), math.ceil(len(faces) / 2500))
@@ -1924,7 +2029,79 @@ def split_hair_part_faces(
     parts = split_hair_parts_by_axis(parts, axis=1, segment_count=segment_count, suffixes=vertical_suffixes(segment_count))
     parts, merged = merge_tiny_hair_face_parts(parts, owner_bbox)
     merged_tiny_buckets += merged
+    parts = refine_large_hair_split_parts(parts, owner_bbox)
     return HairSplitResult(parts=parts, merged_tiny_buckets=merged_tiny_buckets)
+
+
+def refine_large_hair_split_parts(
+    parts: list[HairSplitPart],
+    owner_bbox: tuple[list[float], list[float]],
+) -> list[HairSplitPart]:
+    refined: list[HairSplitPart] = []
+    for part in parts:
+        refined.extend(refine_large_hair_split_part(part, owner_bbox))
+    return refined
+
+
+def refine_large_hair_split_part(
+    part: HairSplitPart,
+    owner_bbox: tuple[list[float], list[float]],
+) -> list[HairSplitPart]:
+    if len(part.faces) < HEAD_HAIR_REFINEMENT_MIN_FACES:
+        return [part]
+
+    owner_min, owner_max = owner_bbox
+    owner_dimensions = bbox_dimensions(owner_min, owner_max)
+    part_min, part_max = faces_bbox(part.faces)
+    part_dimensions = bbox_dimensions(part_min, part_max)
+    longest = max(part_dimensions) if part_dimensions else 0.0
+    if longest <= EPSILON:
+        return [part]
+
+    ranked_axes = sorted(range(3), key=lambda axis: part_dimensions[axis], reverse=True)
+    axes: list[int] = []
+    for axis in ranked_axes:
+        if len(axes) >= HEAD_HAIR_REFINEMENT_MAX_AXES:
+            break
+        if part_dimensions[axis] < longest * HEAD_HAIR_REFINEMENT_MIN_AXIS_RATIO:
+            continue
+        if owner_dimensions[axis] > EPSILON and part_dimensions[axis] < owner_dimensions[axis] * 0.18:
+            continue
+        axes.append(axis)
+    if not axes:
+        return [part]
+
+    refined = [part]
+    for axis in axes:
+        split_targets = [item for item in refined if should_refine_large_hair_split_part(item, owner_dimensions)]
+        if not split_targets:
+            break
+        split_candidates = split_hair_parts_by_axis(
+            split_targets,
+            axis=axis,
+            segment_count=2,
+            suffixes=axis_suffixes(axis, 2),
+        )
+        untouched_parts = [item for item in refined if not should_refine_large_hair_split_part(item, owner_dimensions)]
+        if len(split_candidates) <= len(split_targets):
+            continue
+        refined = untouched_parts + split_candidates
+    return refined
+
+
+def should_refine_large_hair_split_part(part: HairSplitPart, owner_dimensions: list[float]) -> bool:
+    if len(part.faces) > HEAD_HAIR_REFINEMENT_TARGET_FACES:
+        return True
+    if len(part.faces) < HEAD_HAIR_REFINEMENT_MIN_BUCKET_FACES:
+        return False
+    part_min, part_max = faces_bbox(part.faces)
+    part_dimensions = bbox_dimensions(part_min, part_max)
+    large_axes = sum(
+        1
+        for axis, dimension in enumerate(part_dimensions)
+        if owner_dimensions[axis] > EPSILON and dimension >= owner_dimensions[axis] * 0.35
+    )
+    return large_axes >= 2
 
 
 def split_hair_parts_by_axis(
@@ -2369,13 +2546,16 @@ def protect_explicit_face_feature_visibility(
             continue
 
         report_accumulator = report_accumulators.get(part_key.name) if report_accumulators is not None else None
-        if part_key.name == "head_core" or part_key.name.startswith("head_core_front"):
+        if part_key.name == "head_core" or part_key.name.startswith("head_core_"):
             if not config.protect_head_core_front:
                 continue
+            if not accumulator_overlaps_bbox_axes(accumulator, feature_bbox, (0, 1)):
+                continue
             before_bbox = accumulator_bbox(accumulator)
-            if clamp_front_axis_behind_features(accumulator, feature_min, feature_max, depth_margin, front_sign):
-                if report_accumulator is not None:
-                    clamp_front_axis_behind_features(report_accumulator, feature_min, feature_max, depth_margin, front_sign)
+            clamped = clamp_front_axis_behind_features(accumulator, feature_min, feature_max, depth_margin, front_sign)
+            if clamped and report_accumulator is not None:
+                clamp_front_axis_behind_features(report_accumulator, feature_min, feature_max, depth_margin, front_sign)
+            if clamped:
                 actions.append(
                     face_feature_protection_action(
                         owner_bone,
@@ -2463,7 +2643,7 @@ def apply_explicit_face_feature_visibility_protection(
 
 
 def is_head_visibility_part_name(name: str) -> bool:
-    return name == "head_core" or name.startswith("head_core_front") or name.startswith("hair_front")
+    return name == "head_core" or name.startswith("head_core_") or name.startswith("hair_front")
 
 
 def accumulator_bbox(accumulator: BBoxAccumulator) -> tuple[list[float], list[float]]:
@@ -2515,13 +2695,17 @@ def clamp_front_axis_behind_features(
     changed = False
     if front_sign >= 0:
         target_max = feature_min[2] - margin
-        if accumulator.min_xyz[2] < target_max and abs(accumulator.max_xyz[2] - target_max) > EPSILON:
+        if accumulator.max_xyz[2] > target_max and abs(accumulator.max_xyz[2] - target_max) > EPSILON:
             accumulator.max_xyz[2] = target_max
+            if accumulator.min_xyz[2] > target_max:
+                accumulator.min_xyz[2] = target_max
             changed = True
     else:
         target_min = feature_max[2] + margin
-        if accumulator.max_xyz[2] > target_min and abs(accumulator.min_xyz[2] - target_min) > EPSILON:
+        if accumulator.min_xyz[2] < target_min and abs(accumulator.min_xyz[2] - target_min) > EPSILON:
             accumulator.min_xyz[2] = target_min
+            if accumulator.max_xyz[2] < target_min:
+                accumulator.max_xyz[2] = target_min
             changed = True
     if changed:
         reset_accumulator_points_to_bbox(accumulator, "face_feature_protected")
