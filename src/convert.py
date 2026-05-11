@@ -3,8 +3,7 @@ from __future__ import annotations
 import json
 import math
 import struct
-import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -23,9 +22,7 @@ from .errors import ConvertError, InspectError
 from .inspect import SUPPORTED_MODEL_SUFFIXES, build_parent_map, is_valid_index, load_gltf, read_accessor
 from .partition import (
     BonePartition,
-    BoneResolutionReport,
     PartitionReport,
-    bone_resolution_to_dict,
     build_filtered_bone_partitions,
     choose_face_owner,
     fallback_joint_for_skin,
@@ -33,19 +30,60 @@ from .partition import (
     read_optional_accessor,
     resolve_bone_node,
 )
+from .conversion.bbmodel import build_bbmodel
+from .conversion.constants import DEFAULT_COMPLEX_SPLIT_BONE, EPSILON, MIN_CUBE_SIZE
+from .conversion.geometry import (
+    bbox_corners,
+    bbox_dimensions,
+    bbox_volume,
+    box_volume,
+    box_volume_from_dimensions,
+    clamp_point_to_bbox,
+    combined_bbox,
+    compute_scale_and_offset,
+    compute_world_matrices,
+    count_small_cubes,
+    ensure_min_cube_size,
+    has_nonzero_rotation,
+    identity_matrix,
+    matrix_to_euler_xyz_degrees,
+    matrix_translation,
+    normalized_rotation_matrix,
+    oriented_accumulator_bounds,
+    planar_principal_rotation_matrices,
+    points_bbox,
+    points_centroid,
+    principal_axis_3d,
+    rotation_matrix_from_y_axis,
+    row_to_vec3,
+    to_blockbench_space,
+    transform_point,
+    zero_thickness_axes,
+)
+from .conversion.reporting import convert_result_to_dict, format_convert_summary, write_convert_report
+from .conversion.types import (
+    AssignedUnskinnedMesh,
+    AutoSpatialPart,
+    BBoxAccumulator,
+    CleanupPartReport,
+    CleanupReport,
+    ComplexSplitBoneReport,
+    ComplexSplitSubpartReport,
+    ConvertResult,
+    Cuboid,
+    FaceFeatureProtectionAction,
+    HairSplitPart,
+    HairSplitResult,
+    HybridModeReport,
+    OrientedCubeReport,
+    PartKey,
+    SkippedUnskinnedMesh,
+    SplitFace,
+)
 
 
-EPSILON = 1e-6
-MIN_CUBE_SIZE = 0.01
-ZERO_THICKNESS_DIMENSION_RATIO = 0.05
-ZERO_THICKNESS_MIN_PLANE_DIMENSION = MIN_CUBE_SIZE * 8.0
-DEFAULT_COMPLEX_SPLIT_BONE = "head"
 SUPPORTED_CONVERT_MODES = {"cuboid", "hybrid"}
 HYBRID_SPECIAL_CUBE_BONES = ("head", "hair", "skirt", "coat", "accessory")
-QUALITY_LARGEST_CUBES_LIMIT = 10
-QUALITY_TINY_FRAGMENT_CUBES_LIMIT = 20
-QUALITY_ELONGATED_DIMENSION_RATIO = 6.0
-QUALITY_TINY_FRAGMENT_MAX_FACES = 2
 AUTO_SPATIAL_SPLIT_MIN_FACES = 48
 AUTO_SPATIAL_SPLIT_VOLUME_RATIO = 0.004
 AUTO_SPATIAL_SPLIT_LONG_DIM_RATIO = 0.30
@@ -92,202 +130,6 @@ HEAD_MATERIAL_PATTERNS = {
 }
 FACE_FEATURE_PART_PREFIXES = ("eye", "mouth", "brow", "eyelash", "nose")
 SIDE_FEATURE_PART_PREFIXES = ("ear",)
-
-
-@dataclass(frozen=True)
-class PartKey:
-    owner_bone: int
-    name: str
-
-
-@dataclass
-class BBoxAccumulator:
-    min_xyz: list[float] | None = None
-    max_xyz: list[float] | None = None
-    faces: int = 0
-    vertices: set[tuple[str, int]] = field(default_factory=set)
-    points_by_vertex: dict[tuple[str, int], list[float]] = field(default_factory=dict)
-    is_complex_split: bool = False
-
-    def add_face(self, points: list[list[float]], vertex_keys: list[tuple[str, int]]) -> None:
-        if not points:
-            return
-
-        for point in points:
-            self.add_point(point)
-        self.vertices.update(vertex_keys)
-        for point, vertex_key in zip(points, vertex_keys, strict=False):
-            self.points_by_vertex.setdefault(vertex_key, point.copy())
-        self.faces += 1
-
-    def add_point(self, point: list[float]) -> None:
-        if self.min_xyz is None or self.max_xyz is None:
-            self.min_xyz = point.copy()
-            self.max_xyz = point.copy()
-            return
-
-        for index, value in enumerate(point):
-            self.min_xyz[index] = min(self.min_xyz[index], value)
-            self.max_xyz[index] = max(self.max_xyz[index], value)
-
-
-@dataclass
-class Cuboid:
-    owner_bone: int
-    owner_bone_name: str
-    name: str
-    from_xyz: list[float]
-    to_xyz: list[float]
-    origin: list[float]
-    faces: int
-    vertices: int
-    rotation: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
-    rotation_source: str | None = None
-
-
-@dataclass
-class SplitFace:
-    owner_bone: int
-    bone_name: str
-    points: list[list[float]]
-    vertex_keys: list[tuple[str, int]]
-    material_name: str | None
-
-
-@dataclass
-class AutoSpatialPart:
-    name: str
-    faces: list[SplitFace]
-    min_xyz: list[float]
-    max_xyz: list[float]
-
-
-@dataclass
-class HairSplitPart:
-    name: str
-    faces: list[SplitFace]
-    split_axes: set[int] = field(default_factory=set)
-
-
-@dataclass
-class HairSplitResult:
-    parts: list[HairSplitPart]
-    merged_tiny_buckets: int = 0
-
-
-@dataclass
-class ComplexSplitSubpartReport:
-    name: str
-    method: str
-    faces: int
-    vertices: int
-
-
-@dataclass
-class ComplexSplitBoneReport:
-    bone: int
-    bone_name: str
-    source_faces: int
-    subparts: list[ComplexSplitSubpartReport]
-    merged_tiny_components: int = 0
-    deleted_tiny_components: int = 0
-    merged_tiny_hair_buckets: int = 0
-    expanded_hair_bucket_overlap: int = 0
-
-
-@dataclass
-class CleanupPartReport:
-    owner_bone: int
-    owner_bone_name: str
-    name: str
-    action: str
-    reason: str
-    faces: int
-    vertices: int
-    bbox_volume: float
-    target_bone: int | None = None
-    target_bone_name: str | None = None
-
-
-@dataclass
-class CleanupReport:
-    deleted_parts: list[CleanupPartReport] = field(default_factory=list)
-    merged_parts: list[CleanupPartReport] = field(default_factory=list)
-    kept_small_parts: list[CleanupPartReport] = field(default_factory=list)
-
-
-@dataclass
-class OrientedCubeReport:
-    name: str
-    owner_bone: int
-    owner_bone_name: str
-    rotation: list[float]
-    source: str
-
-
-@dataclass(frozen=True)
-class FaceFeatureProtectionAction:
-    owner_bone: int
-    owner_bone_name: str
-    cube_name: str
-    action: str
-    before_bbox: tuple[list[float], list[float]]
-    after_bbox: tuple[list[float], list[float]]
-    feature_bbox: tuple[list[float], list[float]]
-
-
-@dataclass(frozen=True)
-class HybridModeReport:
-    enabled: bool = False
-    special_cube_bones: tuple[str, ...] = ()
-    mesh_strategy: str = "none"
-    cuboid_strategy: str = "one_bbox_per_resolved_bone"
-
-
-@dataclass(frozen=True)
-class SkippedUnskinnedMesh:
-    node_index: int
-    mesh_index: int
-    primitive_index: int | None = None
-    reason: str = "disabled"
-
-
-@dataclass(frozen=True)
-class AssignedUnskinnedMesh:
-    node_index: int
-    mesh_index: int
-    primitive_index: int
-    owner_bone: int
-    owner_bone_name: str
-    part_name: str
-    strategy: str
-    reason: str
-    faces: int
-    vertices: int
-
-
-@dataclass
-class ConvertResult:
-    input_path: Path
-    output_path: Path
-    mode: str
-    preset: str
-    scale: float
-    cubes: list[Cuboid]
-    bone_resolution: BoneResolutionReport
-    empty_bones: int
-    small_cubes: int
-    complex_split: list[ComplexSplitBoneReport]
-    cleanup: CleanupReport
-    oriented_cubes: list[OrientedCubeReport]
-    hybrid: HybridModeReport
-    hybrid_detail_split: HybridDetailSplitConfig
-    unskinned_meshes: UnskinnedMeshesConfig
-    face_feature_protection: FaceFeatureProtectionConfig
-    face_feature_protection_actions: list[FaceFeatureProtectionAction]
-    assigned_unskinned_meshes: list[AssignedUnskinnedMesh]
-    skipped_unskinned_meshes: list[SkippedUnskinnedMesh]
-    warnings: list[str]
 
 
 def convert_model(
@@ -1750,10 +1592,6 @@ def accumulator_from_faces(faces: list[SplitFace]) -> BBoxAccumulator:
     return accumulator
 
 
-def clamp_point_to_bbox(point: list[float], min_xyz: list[float], max_xyz: list[float]) -> list[float]:
-    return [min(max(point[index], min_xyz[index]), max_xyz[index]) for index in range(3)]
-
-
 def auto_spatial_split_axes(dimensions: list[float], model_height: float) -> list[int]:
     ranked_axes = sorted(range(3), key=lambda axis: dimensions[axis], reverse=True)
     axes: list[int] = []
@@ -1774,23 +1612,6 @@ def auto_spatial_segment_count(dimension: float, model_height: float, face_count
         by_dimension = 3
     by_faces = max(2, math.ceil(face_count / AUTO_SPATIAL_SPLIT_TARGET_FACES))
     return max(2, min(max(by_dimension, by_faces), 4))
-
-
-def bbox_dimensions(min_xyz: list[float], max_xyz: list[float]) -> list[float]:
-    return [max(max_xyz[index] - min_xyz[index], 0.0) for index in range(3)]
-
-
-def bbox_volume(min_xyz: list[float], max_xyz: list[float]) -> float:
-    dimensions = bbox_dimensions(min_xyz, max_xyz)
-    return box_volume_from_dimensions(dimensions)
-
-
-def box_volume(min_xyz: list[float], max_xyz: list[float]) -> float:
-    return box_volume_from_dimensions(bbox_dimensions(min_xyz, max_xyz))
-
-
-def box_volume_from_dimensions(dimensions: list[float]) -> float:
-    return dimensions[0] * dimensions[1] * dimensions[2]
 
 
 def generic_component_part_name(
@@ -2825,12 +2646,6 @@ def faces_bbox(faces: list[SplitFace]) -> tuple[list[float], list[float]]:
     return accumulator.min_xyz, accumulator.max_xyz
 
 
-def points_centroid(points: list[list[float]]) -> list[float]:
-    if not points:
-        return [0.0, 0.0, 0.0]
-    return [sum(point[index] for point in points) / len(points) for index in range(3)]
-
-
 def apply_cleanup(
     accumulators: dict[PartKey, BBoxAccumulator],
     bones: dict[int, BonePartition],
@@ -3045,46 +2860,6 @@ def cleanup_part_report(
     )
 
 
-def row_to_vec3(row: list[float | int]) -> list[float]:
-    return [float(row[0] if len(row) > 0 else 0.0), float(row[1] if len(row) > 1 else 0.0), float(row[2] if len(row) > 2 else 0.0)]
-
-
-def combined_bbox(accumulators: Any) -> tuple[list[float], list[float]]:
-    model_min: list[float] | None = None
-    model_max: list[float] | None = None
-    for accumulator in accumulators:
-        if accumulator.min_xyz is None or accumulator.max_xyz is None:
-            continue
-        if model_min is None or model_max is None:
-            model_min = accumulator.min_xyz.copy()
-            model_max = accumulator.max_xyz.copy()
-            continue
-        for index in range(3):
-            model_min[index] = min(model_min[index], accumulator.min_xyz[index])
-            model_max[index] = max(model_max[index], accumulator.max_xyz[index])
-
-    if model_min is None or model_max is None:
-        raise ConvertError("no valid cuboid bounds were produced")
-    return model_min, model_max
-
-
-def compute_scale_and_offset(
-    model_min: list[float], model_max: list[float], target_height: float, warnings: list[str]
-) -> tuple[float, list[float]]:
-    height = model_max[1] - model_min[1]
-    if height <= EPSILON:
-        warnings.append("Model height is zero or nearly zero; target-height scaling was skipped.")
-        scale = 1.0
-    else:
-        scale = target_height / height
-
-    return scale, [
-        (model_min[0] + model_max[0]) * 0.5,
-        model_min[1],
-        (model_min[2] + model_max[2]) * 0.5,
-    ]
-
-
 def build_cuboids(
     accumulators: dict[PartKey, BBoxAccumulator],
     bones: dict[int, BonePartition],
@@ -3293,82 +3068,6 @@ def geometry_auto_orientation_matrices(
     return matrices
 
 
-def principal_axis_3d(points: list[list[float]]) -> list[float] | None:
-    if len(points) < 3:
-        return None
-    centroid = points_centroid(points)
-    covariance = [[0.0, 0.0, 0.0] for _ in range(3)]
-    for point in points:
-        delta = [point[index] - centroid[index] for index in range(3)]
-        for row in range(3):
-            for column in range(3):
-                covariance[row][column] += delta[row] * delta[column]
-    if sum(covariance[index][index] for index in range(3)) <= EPSILON:
-        return None
-
-    dominant_axis = max(range(3), key=lambda index: covariance[index][index])
-    axis = [0.0, 0.0, 0.0]
-    axis[dominant_axis] = 1.0
-    for _ in range(16):
-        next_axis = [sum(covariance[row][column] * axis[column] for column in range(3)) for row in range(3)]
-        normalized = normalized_vec3(next_axis)
-        if normalized is None:
-            return None
-        axis = normalized
-    return axis
-
-
-def planar_principal_rotation_matrices(points: list[list[float]]) -> list[list[list[float]]]:
-    matrices: list[list[list[float]]] = []
-    xy_angle = principal_angle_2d(points, 0, 1)
-    if xy_angle is not None:
-        matrices.append(rotation_matrix_z(xy_angle))
-    yz_angle = principal_angle_2d(points, 1, 2)
-    if yz_angle is not None:
-        matrices.append(rotation_matrix_x(yz_angle))
-    xz_angle = principal_angle_2d(points, 0, 2)
-    if xz_angle is not None:
-        matrices.append(rotation_matrix_y(-xz_angle))
-    return matrices
-
-
-def principal_angle_2d(points: list[list[float]], first_axis: int, second_axis: int) -> float | None:
-    if len(points) < 3:
-        return None
-    center_first = sum(point[first_axis] for point in points) / len(points)
-    center_second = sum(point[second_axis] for point in points) / len(points)
-    variance_first = 0.0
-    variance_second = 0.0
-    covariance = 0.0
-    for point in points:
-        first = point[first_axis] - center_first
-        second = point[second_axis] - center_second
-        variance_first += first * first
-        variance_second += second * second
-        covariance += first * second
-    if variance_first + variance_second <= EPSILON:
-        return None
-    return 0.5 * math.atan2(2.0 * covariance, variance_first - variance_second)
-
-
-def rotation_matrix_x(angle: float) -> list[list[float]]:
-    cosine = math.cos(angle)
-    sine = math.sin(angle)
-    return [[1.0, 0.0, 0.0], [0.0, cosine, -sine], [0.0, sine, cosine]]
-
-
-def rotation_matrix_y(angle: float) -> list[list[float]]:
-    cosine = math.cos(angle)
-    sine = math.sin(angle)
-    return [[cosine, 0.0, sine], [0.0, 1.0, 0.0], [-sine, 0.0, cosine]]
-
-
-def rotation_matrix_z(angle: float) -> list[list[float]]:
-    cosine = math.cos(angle)
-    sine = math.sin(angle)
-    return [[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]]
-
-
 def should_orient_accumulator(
     part_key: PartKey,
     accumulator: BBoxAccumulator,
@@ -3421,795 +3120,9 @@ def bone_direction_rotation_matrix(
     return rotation_matrix_from_y_axis(direction)
 
 
-def rotation_matrix_from_y_axis(direction: list[float]) -> list[list[float]] | None:
-    y_axis = normalized_vec3(direction)
-    if y_axis is None:
-        return None
-    reference = [0.0, 0.0, 1.0]
-    if abs(dot_vec3(y_axis, reference)) > 0.95:
-        reference = [1.0, 0.0, 0.0]
-    x_axis = normalized_vec3(cross_vec3(y_axis, reference))
-    if x_axis is None:
-        return None
-    z_axis = normalized_vec3(cross_vec3(x_axis, y_axis))
-    if z_axis is None:
-        return None
-    columns = [x_axis, y_axis, z_axis]
-    return [[columns[column][row] for column in range(3)] for row in range(3)]
-
-
-def normalized_vec3(values: list[float]) -> list[float] | None:
-    length = math.sqrt(sum(value * value for value in values))
-    if length <= EPSILON:
-        return None
-    return [value / length for value in values]
-
-
-def cross_vec3(left: list[float], right: list[float]) -> list[float]:
-    return [
-        left[1] * right[2] - left[2] * right[1],
-        left[2] * right[0] - left[0] * right[2],
-        left[0] * right[1] - left[1] * right[0],
-    ]
-
-
-def dot_vec3(left: list[float], right: list[float]) -> float:
-    return sum(left[index] * right[index] for index in range(3))
-
-
-def oriented_accumulator_bounds(
-    accumulator: BBoxAccumulator,
-    scale: float,
-    offset: list[float],
-    origin: list[float],
-    rotation_matrix: list[list[float]],
-) -> tuple[list[float], list[float]]:
-    points = list(accumulator.points_by_vertex.values()) or bbox_corners(accumulator.min_xyz, accumulator.max_xyz)
-    local_points = [
-        inverse_rotate_around_origin(to_blockbench_space(point, scale, offset), origin, rotation_matrix)
-        for point in points
-    ]
-    return points_bbox(local_points)
-
-
-def bbox_corners(min_xyz: list[float] | None, max_xyz: list[float] | None) -> list[list[float]]:
-    if min_xyz is None or max_xyz is None:
-        return []
-    return [
-        [x, y, z]
-        for x in (min_xyz[0], max_xyz[0])
-        for y in (min_xyz[1], max_xyz[1])
-        for z in (min_xyz[2], max_xyz[2])
-    ]
-
-
-def points_bbox(points: list[list[float]]) -> tuple[list[float], list[float]]:
-    if not points:
-        return [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
-    min_xyz = points[0].copy()
-    max_xyz = points[0].copy()
-    for point in points[1:]:
-        for index in range(3):
-            min_xyz[index] = min(min_xyz[index], point[index])
-            max_xyz[index] = max(max_xyz[index], point[index])
-    return min_xyz, max_xyz
-
-
-def inverse_rotate_around_origin(
-    point: list[float], origin: list[float], rotation_matrix: list[list[float]]
-) -> list[float]:
-    delta = [point[index] - origin[index] for index in range(3)]
-    return [
-        origin[index] + sum(rotation_matrix[row][index] * delta[row] for row in range(3))
-        for index in range(3)
-    ]
-
-
-def normalized_rotation_matrix(matrix: list[list[float]]) -> list[list[float]]:
-    columns = [[matrix[row][column] for row in range(3)] for column in range(3)]
-    normalized_columns: list[list[float]] = []
-    for column in columns:
-        length = math.sqrt(sum(value * value for value in column))
-        if length <= EPSILON:
-            normalized_columns.append([0.0, 0.0, 0.0])
-        else:
-            normalized_columns.append([value / length for value in column])
-    return [[normalized_columns[column][row] for column in range(3)] for row in range(3)]
-
-
-def matrix_to_euler_xyz_degrees(matrix: list[list[float]]) -> list[float]:
-    sy = math.sqrt(matrix[0][0] * matrix[0][0] + matrix[1][0] * matrix[1][0])
-    if sy > EPSILON:
-        x = math.atan2(matrix[2][1], matrix[2][2])
-        y = math.atan2(-matrix[2][0], sy)
-        z = math.atan2(matrix[1][0], matrix[0][0])
-    else:
-        x = math.atan2(-matrix[1][2], matrix[1][1])
-        y = math.atan2(-matrix[2][0], sy)
-        z = 0.0
-    return [math.degrees(value) for value in (x, y, z)]
-
-
-def has_nonzero_rotation(rotation: list[float]) -> bool:
-    return any(abs(value) > 1e-5 for value in rotation)
-
-
-def count_small_cubes(cuboids: list[Cuboid]) -> int:
-    small = 0
-    for cuboid in cuboids:
-        if any((cuboid.to_xyz[index] - cuboid.from_xyz[index]) <= MIN_CUBE_SIZE + EPSILON for index in range(3)):
-            small += 1
-    return small
-
-
-def to_blockbench_space(point: list[float], scale: float, offset: list[float]) -> list[float]:
-    return [(point[index] - offset[index]) * scale for index in range(3)]
-
-
-def ensure_min_cube_size(
-    from_xyz: list[float],
-    to_xyz: list[float],
-    allow_zero_axes: set[int] | None = None,
-) -> tuple[list[float], list[float]]:
-    result_from = from_xyz.copy()
-    result_to = to_xyz.copy()
-    allow_zero_axes = allow_zero_axes or set()
-    for index in range(3):
-        if result_from[index] > result_to[index]:
-            result_from[index], result_to[index] = result_to[index], result_from[index]
-        size = result_to[index] - result_from[index]
-        if index in allow_zero_axes:
-            center = (result_from[index] + result_to[index]) * 0.5
-            result_from[index] = center
-            result_to[index] = center
-            continue
-        if size < MIN_CUBE_SIZE:
-            center = (result_from[index] + result_to[index]) * 0.5
-            half = MIN_CUBE_SIZE * 0.5
-            result_from[index] = center - half
-            result_to[index] = center + half
-    return result_from, result_to
-
-
-def zero_thickness_axes(from_xyz: list[float], to_xyz: list[float]) -> set[int]:
-    dimensions = bbox_dimensions(from_xyz, to_xyz)
-    ranked_dimensions = sorted(dimensions, reverse=True)
-    if ranked_dimensions[0] <= EPSILON:
-        return set()
-    if ranked_dimensions[1] < ZERO_THICKNESS_MIN_PLANE_DIMENSION:
-        return set()
-
-    candidates = {
-        index
-        for index, dimension in enumerate(dimensions)
-        if dimension <= EPSILON
-        or (
-            dimension < MIN_CUBE_SIZE
-            and dimension / ranked_dimensions[0] <= ZERO_THICKNESS_DIMENSION_RATIO
-        )
-    }
-    return candidates if len(candidates) == 1 else set()
-
-
-def build_bbmodel(
-    name: str,
-    bones: dict[int, BonePartition],
-    world_matrices: dict[int, list[list[float]]],
-    cuboids: list[Cuboid],
-    scale: float,
-    offset: list[float],
-) -> dict[str, Any]:
-    cubes_by_bone: dict[int, list[int]] = {}
-    for cube_index, cuboid in enumerate(cuboids):
-        cubes_by_bone.setdefault(cuboid.owner_bone, []).append(cube_index)
-    cube_uuids = {
-        cube_index: stable_uuid("cube", f"{cuboid.owner_bone}:{cuboid.name}:{cube_index}")
-        for cube_index, cuboid in enumerate(cuboids)
-    }
-    group_uuids = {bone_index: stable_uuid("group", f"{bone_index}:{bone.name}") for bone_index, bone in bones.items()}
-
-    elements = [cube_to_element(cuboid, cube_uuids[cube_index]) for cube_index, cuboid in enumerate(cuboids)]
-    groups = [
-        group_to_dict(
-            bone,
-            group_uuids[bone_index],
-            to_blockbench_space(matrix_translation(world_matrices.get(bone_index, identity_matrix())), scale, offset),
-        )
-        for bone_index, bone in sorted(bones.items())
-    ]
-    roots = [bone for bone in sorted(bones.values(), key=lambda item: item.node_index) if bone.parent is None]
-    outliner = [build_outliner_entry(root, bones, group_uuids, cube_uuids, cubes_by_bone) for root in roots]
-
-    return {
-        "meta": {"format_version": "5.0", "model_format": "free", "box_uv": False},
-        "name": name,
-        "model_identifier": "",
-        "visible_box": [1, 1, 0],
-        "variable_placeholders": "",
-        "variable_placeholder_buttons": [],
-        "timeline_setups": [],
-        "unhandled_root_fields": {},
-        "resolution": {"width": 16, "height": 16},
-        "elements": elements,
-        "groups": groups,
-        "outliner": outliner,
-        "textures": [],
-        "animations": [],
-    }
-
-
-def cube_to_element(cuboid: Cuboid, cube_uuid: str) -> dict[str, Any]:
-    element = {
-        "name": cuboid.name,
-        "box_uv": False,
-        "render_order": "default",
-        "locked": False,
-        "allow_mirror_modeling": True,
-        "from": rounded_vec(cuboid.from_xyz),
-        "to": rounded_vec(cuboid.to_xyz),
-        "autouv": 0,
-        "color": 1,
-        "origin": rounded_vec(cuboid.origin),
-        "faces": default_cube_faces(),
-        "type": "cube",
-        "uuid": cube_uuid,
-    }
-    if has_nonzero_rotation(cuboid.rotation):
-        element["rotation"] = rounded_vec(cuboid.rotation)
-    return element
-
-
-def group_to_dict(bone: BonePartition, group_uuid: str, origin: list[float]) -> dict[str, Any]:
-    return {
-        "uuid": group_uuid,
-        "export": True,
-        "locked": False,
-        "origin": rounded_vec(origin),
-        "rotation": [0, 0, 0],
-        "color": 0,
-        "name": bone.name,
-        "children": [],
-        "reset": False,
-        "shade": True,
-        "mirror_uv": False,
-        "selected": False,
-        "visibility": True,
-        "autouv": 0,
-        "isOpen": True,
-        "primary_selected": False,
-    }
-
-
-def build_outliner_entry(
-    bone: BonePartition,
-    bones: dict[int, BonePartition],
-    group_uuids: dict[int, str],
-    cube_uuids: dict[int, str],
-    cubes_by_bone: dict[int, list[int]],
-) -> dict[str, Any]:
-    children: list[str | dict[str, Any]] = []
-    for child_index in sorted(bone.children):
-        child = bones.get(child_index)
-        if child is not None:
-            children.append(build_outliner_entry(child, bones, group_uuids, cube_uuids, cubes_by_bone))
-    for cube_index in cubes_by_bone.get(bone.node_index, []):
-        children.append(cube_uuids[cube_index])
-
-    return {"uuid": group_uuids[bone.node_index], "isOpen": True, "children": children}
-
-
-def default_cube_faces() -> dict[str, dict[str, list[float]]]:
-    return {
-        "north": {"uv": [0, 0, 16, 16]},
-        "east": {"uv": [0, 0, 16, 16]},
-        "south": {"uv": [0, 0, 16, 16]},
-        "west": {"uv": [0, 0, 16, 16]},
-        "up": {"uv": [0, 0, 16, 16]},
-        "down": {"uv": [0, 0, 16, 16]},
-    }
-
-
-def stable_uuid(kind: str, value: str) -> str:
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"gltf2bb:{kind}:{value}"))
-
-
-def rounded_vec(values: list[float]) -> list[float]:
-    result = []
-    for value in values:
-        if not math.isfinite(value):
-            raise ConvertError("generated non-finite Blockbench coordinate")
-        rounded = round(value, 6)
-        result.append(0.0 if rounded == -0.0 else rounded)
-    return result
-
-
-def compute_world_matrices(nodes: list[dict[str, Any]], parent_map: dict[int, int]) -> dict[int, list[list[float]]]:
-    cache: dict[int, list[list[float]]] = {}
-    visiting: set[int] = set()
-
-    def compute(node_index: int) -> list[list[float]]:
-        if node_index in cache:
-            return cache[node_index]
-        if node_index in visiting:
-            return identity_matrix()
-        visiting.add(node_index)
-        local = node_local_matrix(nodes[node_index])
-        parent = parent_map.get(node_index)
-        if parent is not None and is_valid_index(nodes, parent):
-            world = multiply_matrix(compute(parent), local)
-        else:
-            world = local
-        visiting.remove(node_index)
-        cache[node_index] = world
-        return world
-
-    for node_index in range(len(nodes)):
-        compute(node_index)
-    return cache
-
-
-def node_local_matrix(node: dict[str, Any]) -> list[list[float]]:
-    matrix = node.get("matrix")
-    if matrix is not None:
-        if len(matrix) != 16:
-            return identity_matrix()
-        return [
-            [float(matrix[0]), float(matrix[4]), float(matrix[8]), float(matrix[12])],
-            [float(matrix[1]), float(matrix[5]), float(matrix[9]), float(matrix[13])],
-            [float(matrix[2]), float(matrix[6]), float(matrix[10]), float(matrix[14])],
-            [float(matrix[3]), float(matrix[7]), float(matrix[11]), float(matrix[15])],
-        ]
-
-    translation = [float(value) for value in node.get("translation", [0.0, 0.0, 0.0])]
-    rotation = [float(value) for value in node.get("rotation", [0.0, 0.0, 0.0, 1.0])]
-    scale = [float(value) for value in node.get("scale", [1.0, 1.0, 1.0])]
-    return multiply_matrix(multiply_matrix(translation_matrix(translation), quaternion_matrix(rotation)), scale_matrix(scale))
-
-
-def identity_matrix() -> list[list[float]]:
-    return [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-
-
-def translation_matrix(translation: list[float]) -> list[list[float]]:
-    matrix = identity_matrix()
-    matrix[0][3] = translation[0] if len(translation) > 0 else 0.0
-    matrix[1][3] = translation[1] if len(translation) > 1 else 0.0
-    matrix[2][3] = translation[2] if len(translation) > 2 else 0.0
-    return matrix
-
-
-def scale_matrix(scale: list[float]) -> list[list[float]]:
-    matrix = identity_matrix()
-    matrix[0][0] = scale[0] if len(scale) > 0 else 1.0
-    matrix[1][1] = scale[1] if len(scale) > 1 else 1.0
-    matrix[2][2] = scale[2] if len(scale) > 2 else 1.0
-    return matrix
-
-
-def quaternion_matrix(rotation: list[float]) -> list[list[float]]:
-    x = rotation[0] if len(rotation) > 0 else 0.0
-    y = rotation[1] if len(rotation) > 1 else 0.0
-    z = rotation[2] if len(rotation) > 2 else 0.0
-    w = rotation[3] if len(rotation) > 3 else 1.0
-    length = math.sqrt(x * x + y * y + z * z + w * w)
-    if length <= EPSILON:
-        return identity_matrix()
-    x /= length
-    y /= length
-    z /= length
-    w /= length
-
-    xx = x * x
-    yy = y * y
-    zz = z * z
-    xy = x * y
-    xz = x * z
-    yz = y * z
-    wx = w * x
-    wy = w * y
-    wz = w * z
-    return [
-        [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy), 0.0],
-        [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx), 0.0],
-        [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy), 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-
-
-def multiply_matrix(left: list[list[float]], right: list[list[float]]) -> list[list[float]]:
-    return [
-        [sum(left[row][inner] * right[inner][column] for inner in range(4)) for column in range(4)]
-        for row in range(4)
-    ]
-
-
-def transform_point(matrix: list[list[float]], point: list[float]) -> list[float]:
-    x, y, z = point
-    return [
-        matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z + matrix[0][3],
-        matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z + matrix[1][3],
-        matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z + matrix[2][3],
-    ]
-
-
-def matrix_translation(matrix: list[list[float]]) -> list[float]:
-    return [matrix[0][3], matrix[1][3], matrix[2][3]]
-
-
-def convert_result_to_dict(result: ConvertResult) -> dict[str, Any]:
-    return {
-        "file": str(result.input_path),
-        "output": str(result.output_path),
-        "mode": result.mode,
-        "preset": result.preset,
-        "scale": result.scale,
-        "totals": {
-            "cubes": len(result.cubes),
-            "original_bones": result.bone_resolution.original_bones,
-            "kept_bones": result.bone_resolution.kept_bones,
-            "merged_bones": len(result.bone_resolution.merged_to_parent),
-            "ignored_bones": len(result.bone_resolution.ignored),
-            "empty_bones": result.empty_bones,
-            "small_cubes": result.small_cubes,
-            "complex_split_bones": len(result.complex_split),
-            "hybrid_special_cube_bones": len(result.hybrid.special_cube_bones),
-            "deleted_small_parts": len(result.cleanup.deleted_parts),
-            "merged_small_parts": len(result.cleanup.merged_parts),
-            "kept_small_parts": len(result.cleanup.kept_small_parts),
-            "oriented_cubes": len(result.oriented_cubes),
-            "assigned_unskinned_meshes": len(result.assigned_unskinned_meshes),
-            "skipped_unskinned_meshes": len(result.skipped_unskinned_meshes),
-        },
-        "bone_resolution": bone_resolution_to_dict(result.bone_resolution),
-        "hybrid": hybrid_to_dict(result.hybrid),
-        "hybrid_detail_split": hybrid_detail_split_to_dict(result.hybrid_detail_split),
-        "face_feature_protection": face_feature_protection_to_dict(
-            result.face_feature_protection,
-            result.face_feature_protection_actions,
-        ),
-        "unskinned_meshes": unskinned_meshes_to_dict(
-            result.unskinned_meshes,
-            result.assigned_unskinned_meshes,
-            result.skipped_unskinned_meshes,
-        ),
-        "complex_split": [complex_split_to_dict(item) for item in result.complex_split],
-        "cleanup": cleanup_to_dict(result.cleanup),
-        "oriented_cubes": [oriented_cube_to_dict(item) for item in result.oriented_cubes],
-        "quality": quality_to_dict(result),
-        "cubes": [cuboid_to_dict(cuboid) for cuboid in result.cubes],
-        "warnings": result.warnings,
-}
-
-
-def hybrid_to_dict(item: HybridModeReport) -> dict[str, Any]:
-    return {
-        "enabled": item.enabled,
-        "special_cube_bones": list(item.special_cube_bones),
-        "mesh_strategy": item.mesh_strategy,
-        "cuboid_strategy": item.cuboid_strategy,
-    }
-
-
-def hybrid_detail_split_to_dict(item: HybridDetailSplitConfig) -> dict[str, Any]:
-    return {
-        "enabled": item.enabled,
-        "min_faces": item.min_faces,
-        "max_long_dim_ratio": item.max_long_dim_ratio,
-        "by_material": item.by_material,
-        "by_connected_component": item.by_connected_component,
-        "min_material_faces": item.min_material_faces,
-        "min_material_ratio": item.min_material_ratio,
-        "min_component_faces": item.min_component_faces,
-        "min_component_ratio": item.min_component_ratio,
-    }
-
-
-def face_feature_protection_to_dict(
-    config: FaceFeatureProtectionConfig,
-    actions: list[FaceFeatureProtectionAction],
-) -> dict[str, Any]:
-    return {
-        "enabled": config.enabled,
-        "min_faces": config.min_faces,
-        "margin_ratio": config.margin_ratio,
-        "outlier_gap_ratio": config.outlier_gap_ratio,
-        "protect_hair_front": config.protect_hair_front,
-        "protect_head_core_front": config.protect_head_core_front,
-        "actions": [face_feature_protection_action_to_dict(action) for action in actions],
-    }
-
-
-def face_feature_protection_action_to_dict(item: FaceFeatureProtectionAction) -> dict[str, Any]:
-    return {
-        "owner_bone": item.owner_bone,
-        "owner_bone_name": item.owner_bone_name,
-        "cube_name": item.cube_name,
-        "action": item.action,
-        "before_bbox": bbox_to_dict(item.before_bbox),
-        "after_bbox": bbox_to_dict(item.after_bbox),
-        "feature_bbox": bbox_to_dict(item.feature_bbox),
-    }
-
-
-def bbox_to_dict(bbox: tuple[list[float], list[float]]) -> dict[str, Any]:
-    return {"min": rounded_vec(bbox[0]), "max": rounded_vec(bbox[1])}
-
-
-def unskinned_meshes_to_dict(
-    config: UnskinnedMeshesConfig,
-    assigned: list[AssignedUnskinnedMesh],
-    skipped: list[SkippedUnskinnedMesh],
-) -> dict[str, Any]:
-    return {
-        "enabled": config.enabled,
-        "strategy": config.strategy,
-        "ignore_material_name_contains": list(config.ignore_material_name_contains),
-        "ignore_node_name_contains": list(config.ignore_node_name_contains),
-        "ignore_mesh_name_contains": list(config.ignore_mesh_name_contains),
-        "case_sensitive": config.case_sensitive,
-        "assigned": [assigned_unskinned_mesh_to_dict(item) for item in assigned],
-        "skipped": [skipped_unskinned_mesh_to_dict(item) for item in skipped],
-    }
-
-
-def assigned_unskinned_mesh_to_dict(item: AssignedUnskinnedMesh) -> dict[str, Any]:
-    return {
-        "node_index": item.node_index,
-        "mesh_index": item.mesh_index,
-        "primitive_index": item.primitive_index,
-        "owner_bone": item.owner_bone,
-        "owner_bone_name": item.owner_bone_name,
-        "part_name": item.part_name,
-        "strategy": item.strategy,
-        "reason": item.reason,
-        "faces": item.faces,
-        "vertices": item.vertices,
-    }
-
-
-def skipped_unskinned_mesh_to_dict(item: SkippedUnskinnedMesh) -> dict[str, Any]:
-    return {
-        "node_index": item.node_index,
-        "mesh_index": item.mesh_index,
-        "primitive_index": item.primitive_index,
-        "reason": item.reason,
-    }
-
-
-def complex_split_to_dict(item: ComplexSplitBoneReport) -> dict[str, Any]:
-    return {
-        "bone": item.bone,
-        "bone_name": item.bone_name,
-        "source_faces": item.source_faces,
-        "subparts": [complex_split_subpart_to_dict(subpart) for subpart in item.subparts],
-        "merged_tiny_components": item.merged_tiny_components,
-        "deleted_tiny_components": item.deleted_tiny_components,
-        "merged_tiny_hair_buckets": item.merged_tiny_hair_buckets,
-        "expanded_hair_bucket_overlap": item.expanded_hair_bucket_overlap,
-    }
-
-
-def complex_split_subpart_to_dict(item: ComplexSplitSubpartReport) -> dict[str, Any]:
-    return {
-        "name": item.name,
-        "method": item.method,
-        "faces": item.faces,
-        "vertices": item.vertices,
-    }
-
-
-def cleanup_to_dict(item: CleanupReport) -> dict[str, Any]:
-    return {
-        "deleted_parts": [cleanup_part_to_dict(part) for part in item.deleted_parts],
-        "merged_parts": [cleanup_part_to_dict(part) for part in item.merged_parts],
-        "kept_small_parts": [cleanup_part_to_dict(part) for part in item.kept_small_parts],
-    }
-
-
-def cleanup_part_to_dict(item: CleanupPartReport) -> dict[str, Any]:
-    return {
-        "owner_bone": item.owner_bone,
-        "owner_bone_name": item.owner_bone_name,
-        "name": item.name,
-        "action": item.action,
-        "reason": item.reason,
-        "faces": item.faces,
-        "vertices": item.vertices,
-        "bbox_volume": item.bbox_volume,
-        "target_bone": item.target_bone,
-        "target_bone_name": item.target_bone_name,
-    }
-
-
-def oriented_cube_to_dict(item: OrientedCubeReport) -> dict[str, Any]:
-    return {
-        "name": item.name,
-        "owner_bone": item.owner_bone,
-        "owner_bone_name": item.owner_bone_name,
-        "rotation": rounded_vec(item.rotation),
-        "source": item.source,
-    }
-
-
-def quality_to_dict(result: ConvertResult) -> dict[str, Any]:
-    return {
-        "largest_cubes": [quality_cube_to_dict(cuboid) for cuboid in largest_quality_cubes(result.cubes)],
-        "unrotated_elongated_cubes": [
-            quality_unrotated_elongated_cube_to_dict(cuboid, reason)
-            for cuboid, reason in unrotated_elongated_quality_cubes(result.cubes)
-        ],
-        "tiny_fragment_cubes": [
-            quality_tiny_fragment_cube_to_dict(cuboid)
-            for cuboid in tiny_fragment_quality_cubes(result.cubes)
-        ],
-        "skipped_unskinned_meshes_summary": skipped_unskinned_meshes_summary_to_dict(
-            result.skipped_unskinned_meshes
-        ),
-    }
-
-
-def largest_quality_cubes(cuboids: list[Cuboid]) -> list[Cuboid]:
-    return sorted(
-        cuboids,
-        key=lambda cuboid: (cube_volume(cuboid), max(cube_dimensions(cuboid), default=0.0), cuboid.faces),
-        reverse=True,
-    )[:QUALITY_LARGEST_CUBES_LIMIT]
-
-
-def unrotated_elongated_quality_cubes(cuboids: list[Cuboid]) -> list[tuple[Cuboid, str]]:
-    flagged: list[tuple[Cuboid, str]] = []
-    for cuboid in cuboids:
-        reason = unrotated_elongated_reason(cuboid)
-        if reason is not None:
-            flagged.append((cuboid, reason))
-    return sorted(flagged, key=lambda item: cube_elongation_ratio(item[0]), reverse=True)
-
-
-def tiny_fragment_quality_cubes(cuboids: list[Cuboid]) -> list[Cuboid]:
-    model_height = model_height_from_cubes(cuboids)
-    max_dimension = max(MIN_CUBE_SIZE * 2.0, model_height * 0.03)
-    tiny = [
-        cuboid
-        for cuboid in cuboids
-        if cuboid.faces <= QUALITY_TINY_FRAGMENT_MAX_FACES
-        and max(cube_dimensions(cuboid), default=0.0) <= max_dimension
-    ]
-    return sorted(tiny, key=lambda cuboid: (cube_volume(cuboid), cuboid.faces, cuboid.name))[
-        :QUALITY_TINY_FRAGMENT_CUBES_LIMIT
-    ]
-
-
-def quality_cube_to_dict(cuboid: Cuboid) -> dict[str, Any]:
-    dimensions = cube_dimensions(cuboid)
-    return {
-        "name": cuboid.name,
-        "owner_bone": cuboid.owner_bone,
-        "owner_bone_name": cuboid.owner_bone_name,
-        "dimensions": rounded_vec(dimensions),
-        "volume": rounded_number(box_volume_from_dimensions(dimensions)),
-        "faces": cuboid.faces,
-        "rotation_source": cuboid.rotation_source,
-    }
-
-
-def quality_unrotated_elongated_cube_to_dict(cuboid: Cuboid, reason: str) -> dict[str, Any]:
-    data = quality_cube_to_dict(cuboid)
-    data["reason"] = reason
-    return data
-
-
-def quality_tiny_fragment_cube_to_dict(cuboid: Cuboid) -> dict[str, Any]:
-    dimensions = cube_dimensions(cuboid)
-    return {
-        "name": cuboid.name,
-        "owner_bone": cuboid.owner_bone,
-        "owner_bone_name": cuboid.owner_bone_name,
-        "faces": cuboid.faces,
-        "dimensions": rounded_vec(dimensions),
-        "volume": rounded_number(box_volume_from_dimensions(dimensions)),
-    }
-
-
-def skipped_unskinned_meshes_summary_to_dict(items: list[SkippedUnskinnedMesh]) -> dict[str, Any]:
-    return {
-        "count": len(items),
-        "node_indices": sorted({item.node_index for item in items}),
-        "mesh_indices": sorted({item.mesh_index for item in items}),
-        "reasons": sorted({item.reason for item in items}),
-    }
-
-
-def unrotated_elongated_reason(cuboid: Cuboid) -> str | None:
-    if has_nonzero_rotation(cuboid.rotation):
-        return None
-    ratio = cube_elongation_ratio(cuboid)
-    if ratio < QUALITY_ELONGATED_DIMENSION_RATIO:
-        return None
-    return f"long_dim/second_dim={ratio:.2f}>={QUALITY_ELONGATED_DIMENSION_RATIO:.2f}; no rotation"
-
-
-def cube_elongation_ratio(cuboid: Cuboid) -> float:
-    dimensions = sorted(cube_dimensions(cuboid), reverse=True)
-    if not dimensions or dimensions[0] <= EPSILON:
-        return 0.0
-    if len(dimensions) < 2 or dimensions[1] <= EPSILON:
-        return math.inf
-    return dimensions[0] / dimensions[1]
-
-
-def cube_dimensions(cuboid: Cuboid) -> list[float]:
-    return bbox_dimensions(cuboid.from_xyz, cuboid.to_xyz)
-
-
-def cube_volume(cuboid: Cuboid) -> float:
-    return box_volume_from_dimensions(cube_dimensions(cuboid))
-
-
-def model_height_from_cubes(cuboids: list[Cuboid]) -> float:
-    if not cuboids:
-        return 0.0
-    min_y = min(min(cuboid.from_xyz[1], cuboid.to_xyz[1]) for cuboid in cuboids)
-    max_y = max(max(cuboid.from_xyz[1], cuboid.to_xyz[1]) for cuboid in cuboids)
-    return max(max_y - min_y, 0.0)
-
-
-def rounded_number(value: float) -> float:
-    if not math.isfinite(value):
-        raise ConvertError("generated non-finite quality metric")
-    rounded = round(value, 6)
-    return 0.0 if rounded == -0.0 else rounded
-
-
-def cuboid_to_dict(cuboid: Cuboid) -> dict[str, Any]:
-    data = {
-        "owner_bone": cuboid.owner_bone,
-        "name": cuboid.name,
-        "from": rounded_vec(cuboid.from_xyz),
-        "to": rounded_vec(cuboid.to_xyz),
-        "origin": rounded_vec(cuboid.origin),
-        "faces": cuboid.faces,
-        "vertices": cuboid.vertices,
-    }
-    if has_nonzero_rotation(cuboid.rotation):
-        data["rotation"] = rounded_vec(cuboid.rotation)
-        data["rotation_source"] = cuboid.rotation_source
-    return data
-
-
-def write_convert_report(result: ConvertResult, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(convert_result_to_dict(result), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-
-
-def format_convert_summary(result: ConvertResult) -> str:
-    lines = [
-        f"File: {result.input_path}",
-        f"Mode: {result.mode}",
-        f"Preset: {result.preset}",
-        f"Scale: {result.scale:.6g}",
-        f"Cubes: {len(result.cubes)}",
-        f"Bones: {result.bone_resolution.kept_bones} kept / {result.bone_resolution.original_bones} original",
-        f"Merged bones: {len(result.bone_resolution.merged_to_parent)}",
-        f"Ignored bones: {len(result.bone_resolution.ignored)}",
-        f"Empty bones: {result.empty_bones}",
-        f"Small cubes: {result.small_cubes}",
-        f"Complex splits: {len(result.complex_split)}",
-        f"Hybrid strategy: {result.hybrid.mesh_strategy if result.hybrid.enabled else 'off'}",
-        f"Cleanup deleted parts: {len(result.cleanup.deleted_parts)}",
-        f"Cleanup merged parts: {len(result.cleanup.merged_parts)}",
-        f"Oriented cubes: {len(result.oriented_cubes)}",
-        f"Unskinned meshes: {len(result.assigned_unskinned_meshes)} assigned / {len(result.skipped_unskinned_meshes)} skipped",
-        f"Output: {result.output_path}",
-    ]
-    if result.warnings:
-        lines.extend(["", "Warnings:"])
-        lines.extend(f"  - {warning}" for warning in result.warnings)
-    return "\n".join(lines)
+__all__ = [
+    "convert_model",
+    "convert_result_to_dict",
+    "format_convert_summary",
+    "write_convert_report",
+]

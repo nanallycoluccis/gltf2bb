@@ -36,7 +36,7 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     wheel_path = Path(wheel_directory) / WHEEL_NAME
     files = {
         path.relative_to(PROJECT_ROOT).as_posix(): path.read_bytes()
-        for path in sorted((PROJECT_ROOT / "src").glob("*.py"))
+        for path in sorted((PROJECT_ROOT / "src").rglob("*.py"))
     }
     files.update(
         {
