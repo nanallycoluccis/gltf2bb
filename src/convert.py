@@ -1285,6 +1285,9 @@ def apply_generic_complex_split(
     report_accumulators: dict[str, BBoxAccumulator] = {}
     report_methods: dict[str, str] = {}
     bone_name = faces[0].bone_name if faces else f"bone_{owner_bone}"
+    owner_min, owner_max = owner_bbox
+    owner_height = max(owner_max[1] - owner_min[1], EPSILON)
+    owner_volume = bbox_volume(owner_min, owner_max)
 
     def add_to_part(part_name: str, method: str, part_faces: list[SplitFace]) -> None:
         accumulator = accumulators.setdefault(PartKey(owner_bone, part_name), BBoxAccumulator())
@@ -1306,7 +1309,26 @@ def apply_generic_complex_split(
             generic_component_part_name(bone_name, component_faces, owner_bbox, component_index),
             report_accumulators,
         )
-        add_to_part(part_name, "connected_component", component_faces)
+        component_accumulator = accumulator_from_faces(component_faces)
+        split_parts = []
+        if (
+            should_generic_complex_auto_spatial_split(bone_name)
+            and len(component_faces) >= AUTO_SPATIAL_SPLIT_MIN_FACES
+            and should_auto_spatial_split(component_accumulator, owner_height, owner_volume)
+        ):
+            split_parts = generic_complex_auto_spatial_split_faces(
+                part_name,
+                component_faces,
+                component_accumulator,
+                owner_height,
+                generic_complex_auto_spatial_axis_limit(bone_name),
+            )
+        if len(split_parts) >= 2:
+            for split_part in split_parts:
+                split_part_name = unique_part_name(split_part.name, report_accumulators)
+                add_to_part(split_part_name, "auto_spatial_grid", split_part.faces)
+        else:
+            add_to_part(part_name, "connected_component", component_faces)
         if merged_faces:
             add_to_part(part_name, "connected_component_merge", merged_faces)
 
@@ -1327,6 +1349,33 @@ def apply_generic_complex_split(
         merged_tiny_components=merged_tiny_components,
         deleted_tiny_components=deleted_tiny_components,
     )
+
+
+def should_generic_complex_auto_spatial_split(bone_name: str) -> bool:
+    normalized = bone_name.casefold()
+    if "hair" in normalized or "髪" in bone_name or "髮" in bone_name:
+        return False
+    return any(
+        token in normalized
+        for token in (
+            "hood",
+            "string",
+            "spine",
+            "chest",
+            "upperarm",
+            "lowerarm",
+            "shoulder",
+            "sleeve",
+            "arm",
+        )
+    )
+
+
+def generic_complex_auto_spatial_axis_limit(bone_name: str) -> int:
+    normalized = bone_name.casefold()
+    if any(token in normalized for token in ("spine", "chest", "shoulder", "hood")):
+        return 2
+    return 1
 
 
 def apply_regular_detail_split(
@@ -1630,6 +1679,27 @@ def auto_spatial_split_faces(
     return [part for part in parts if part.faces]
 
 
+def generic_complex_auto_spatial_split_faces(
+    part_name: str,
+    faces: list[SplitFace],
+    accumulator: BBoxAccumulator,
+    model_height: float,
+    max_axes: int,
+) -> list[AutoSpatialPart]:
+    if accumulator.min_xyz is None or accumulator.max_xyz is None:
+        return []
+    dimensions = bbox_dimensions(accumulator.min_xyz, accumulator.max_xyz)
+    axes = auto_spatial_split_axes(dimensions, model_height)[:max(1, max_axes)]
+    if not axes:
+        return []
+
+    parts = [AutoSpatialPart(sanitize_part_name(part_name), faces, accumulator.min_xyz.copy(), accumulator.max_xyz.copy())]
+    for axis in axes:
+        segment_count = auto_spatial_segment_count(dimensions[axis], model_height, len(faces))
+        parts = split_auto_spatial_parts(parts, axis, segment_count)
+    return [part for part in parts if part.faces]
+
+
 def split_auto_spatial_parts(
     parts: list[AutoSpatialPart],
     axis: int,
@@ -1670,6 +1740,13 @@ def accumulator_from_auto_spatial_part(part: AutoSpatialPart) -> BBoxAccumulator
         accumulator.vertices.update(face.vertex_keys)
         for point, vertex_key in zip(face.points, face.vertex_keys, strict=False):
             accumulator.points_by_vertex.setdefault(vertex_key, clamp_point_to_bbox(point, part.min_xyz, part.max_xyz))
+    return accumulator
+
+
+def accumulator_from_faces(faces: list[SplitFace]) -> BBoxAccumulator:
+    accumulator = BBoxAccumulator()
+    for face in faces:
+        accumulator.add_face(face.points, face.vertex_keys)
     return accumulator
 
 

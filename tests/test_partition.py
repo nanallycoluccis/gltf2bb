@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from src.config import preset_config, preset_names
 from src.partition import partition_model, partition_report_to_dict
 
 
@@ -61,6 +62,21 @@ class PartitionModelTest(unittest.TestCase):
         self.assertEqual(data["totals"]["kept_bones"], 3)
         self.assertEqual(data["totals"]["merged_bones"], 0)
         self.assertEqual(bones["twist_helper_joint"]["faces"], 1)
+
+    def test_vroid_preset_keeps_secondary_hair_and_face_eye_bones(self) -> None:
+        config = preset_config("vroid")
+
+        self.assertIn("vroid", preset_names())
+        self.assertEqual(config.preset, "vroid")
+        self.assertIn(r"_end(?:_|$)", config.bone_filter.merge_to_parent_name_regex)
+        self.assertIn("hair", config.complex_split.bones)
+        self.assertIn("hood", config.complex_split.bones)
+        self.assertIn("string", config.complex_split.bones)
+        self.assertIn("chest", config.complex_split.bones)
+        self.assertIn("shoulder", config.complex_split.bones)
+        self.assertIn("upperarm", config.complex_split.bones)
+        self.assertNotIn("J_Sec_Hair", config.bone_filter.merge_to_parent_name_contains)
+        self.assertNotIn("J_Adj_", config.bone_filter.merge_to_parent_name_contains)
 
 
 def write_two_bone_fixture(path: Path) -> None:

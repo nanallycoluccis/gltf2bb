@@ -114,6 +114,29 @@ BUILTIN_PRESETS: dict[str, ProcessingConfig] = {
             merge_to_parent_name_contains=("twist", "helper", "secondary", "spring", "補助", "捩"),
         ),
     ),
+    "vroid": ProcessingConfig(
+        preset="vroid",
+        bone_filter=BoneFilterConfig(
+            ignore_name_contains=("Collider", "SpringBone"),
+            merge_to_parent_name_regex=(r"_end(?:_|$)",),
+        ),
+        complex_split=ComplexSplitConfig(
+            enabled=True,
+            bones=(
+                "head",
+                "hair",
+                "hood",
+                "string",
+                "spine",
+                "chest",
+                "upperchest",
+                "shoulder",
+                "upperarm",
+                "lowerarm",
+            ),
+            connected_components=ConnectedComponentsConfig(min_faces=4),
+        ),
+    ),
 }
 
 
