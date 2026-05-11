@@ -64,6 +64,16 @@ class HybridDetailSplitConfig:
 
 
 @dataclass(frozen=True)
+class UnskinnedMeshesConfig:
+    enabled: bool = False
+    strategy: str = "node_parent"
+    ignore_material_name_contains: tuple[str, ...] = ("mmd_tools_rigid",)
+    ignore_node_name_contains: tuple[str, ...] = ()
+    ignore_mesh_name_contains: tuple[str, ...] = ()
+    case_sensitive: bool = False
+
+
+@dataclass(frozen=True)
 class ProcessingConfig:
     preset: str = "default"
     bone_filter: BoneFilterConfig = field(default_factory=BoneFilterConfig)
@@ -71,6 +81,10 @@ class ProcessingConfig:
     cleanup: CleanupConfig = field(default_factory=CleanupConfig)
     oriented_cubes: OrientedCubesConfig = field(default_factory=OrientedCubesConfig)
     hybrid_detail_split: HybridDetailSplitConfig = field(default_factory=HybridDetailSplitConfig)
+    unskinned_meshes: UnskinnedMeshesConfig = field(default_factory=UnskinnedMeshesConfig)
+
+
+UNSKINNED_MESH_STRATEGIES = {"node_parent", "nearest_bone", "node_parent_then_nearest"}
 
 
 BUILTIN_PRESETS: dict[str, ProcessingConfig] = {
@@ -152,6 +166,7 @@ def merge_config_data(config: ProcessingConfig, data: dict[str, Any]) -> Process
     cleanup = config.cleanup
     oriented_cubes = config.oriented_cubes
     hybrid_detail_split = config.hybrid_detail_split
+    unskinned_meshes = config.unskinned_meshes
 
     raw_bone_filter = data.get("bone_filter")
     if isinstance(raw_bone_filter, dict):
@@ -189,6 +204,12 @@ def merge_config_data(config: ProcessingConfig, data: dict[str, Any]) -> Process
     elif raw_hybrid_detail_split is not None:
         raise ConfigError("hybrid_detail_split must be an object")
 
+    raw_unskinned_meshes = data.get("unskinned_meshes")
+    if isinstance(raw_unskinned_meshes, dict):
+        unskinned_meshes = merge_unskinned_meshes_data(unskinned_meshes, raw_unskinned_meshes)
+    elif raw_unskinned_meshes is not None:
+        raise ConfigError("unskinned_meshes must be an object")
+
     return replace(
         config,
         bone_filter=bone_filter,
@@ -196,6 +217,7 @@ def merge_config_data(config: ProcessingConfig, data: dict[str, Any]) -> Process
         cleanup=cleanup,
         oriented_cubes=oriented_cubes,
         hybrid_detail_split=hybrid_detail_split,
+        unskinned_meshes=unskinned_meshes,
     )
 
 
@@ -337,6 +359,36 @@ def merge_hybrid_detail_split_data(
     for key in ("max_long_dim_ratio", "min_material_ratio", "min_component_ratio"):
         if key in data:
             updates[key] = parse_non_negative_number(data[key], f"hybrid_detail_split.{key}")
+
+    return replace(config, **updates)
+
+
+def merge_unskinned_meshes_data(
+    config: UnskinnedMeshesConfig,
+    data: dict[str, Any],
+) -> UnskinnedMeshesConfig:
+    updates: dict[str, Any] = {}
+    if "enabled" in data:
+        if not isinstance(data["enabled"], bool):
+            raise ConfigError("unskinned_meshes.enabled must be a boolean")
+        updates["enabled"] = data["enabled"]
+    if "strategy" in data:
+        strategy = data["strategy"]
+        if not isinstance(strategy, str) or strategy not in UNSKINNED_MESH_STRATEGIES:
+            supported = ", ".join(sorted(UNSKINNED_MESH_STRATEGIES))
+            raise ConfigError(f"unskinned_meshes.strategy must be one of: {supported}")
+        updates["strategy"] = strategy
+    for key in (
+        "ignore_material_name_contains",
+        "ignore_node_name_contains",
+        "ignore_mesh_name_contains",
+    ):
+        if key in data:
+            updates[key] = parse_string_list(data[key], f"unskinned_meshes.{key}")
+    if "case_sensitive" in data:
+        if not isinstance(data["case_sensitive"], bool):
+            raise ConfigError("unskinned_meshes.case_sensitive must be a boolean")
+        updates["case_sensitive"] = data["case_sensitive"]
 
     return replace(config, **updates)
 

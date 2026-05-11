@@ -14,6 +14,7 @@ from .config import (
     HybridDetailSplitConfig,
     OrientedCubesConfig,
     ProcessingConfig,
+    UnskinnedMeshesConfig,
     resolve_processing_config,
 )
 from .constants import MODE_TRIANGLES, MODE_TRIANGLE_FAN, MODE_TRIANGLE_STRIP
@@ -67,6 +68,8 @@ HAIR_BUCKET_MIN_FACES = 4
 HAIR_BUCKET_MIN_FACE_RATIO = 0.08
 HAIR_BUCKET_OVERLAP_RATIO = 0.015
 HAIR_BUCKET_OVERLAP_MIN = MIN_CUBE_SIZE * 0.25
+FACE_FEATURE_PROTECTION_MARGIN_RATIO = 0.002
+FACE_FEATURE_PROTECTION_MIN_FACES = 32
 COMPLEX_BONE_ALIASES = {
     "head": ("head", "頭", "頭部"),
     "hair": ("hair", "髪", "hair_", "hair-"),
@@ -233,6 +236,22 @@ class HybridModeReport:
 class SkippedUnskinnedMesh:
     node_index: int
     mesh_index: int
+    primitive_index: int | None = None
+    reason: str = "disabled"
+
+
+@dataclass(frozen=True)
+class AssignedUnskinnedMesh:
+    node_index: int
+    mesh_index: int
+    primitive_index: int
+    owner_bone: int
+    owner_bone_name: str
+    part_name: str
+    strategy: str
+    reason: str
+    faces: int
+    vertices: int
 
 
 @dataclass
@@ -251,6 +270,8 @@ class ConvertResult:
     oriented_cubes: list[OrientedCubeReport]
     hybrid: HybridModeReport
     hybrid_detail_split: HybridDetailSplitConfig
+    unskinned_meshes: UnskinnedMeshesConfig
+    assigned_unskinned_meshes: list[AssignedUnskinnedMesh]
     skipped_unskinned_meshes: list[SkippedUnskinnedMesh]
     warnings: list[str]
 
@@ -301,6 +322,7 @@ def convert_model(
     accumulators: dict[PartKey, BBoxAccumulator] = {}
     regular_faces_by_part: dict[PartKey, list[SplitFace]] = {}
     split_faces: list[SplitFace] = []
+    assigned_unskinned_meshes: list[AssignedUnskinnedMesh] = []
     skipped_unskinned_meshes: list[SkippedUnskinnedMesh] = []
 
     scratch_report = PartitionReport(
@@ -326,8 +348,67 @@ def convert_model(
             warnings.append(f"Node {node_index} references missing mesh {mesh_index}; skipped convert.")
             continue
         if skin_index is None:
-            skipped_unskinned_meshes.append(SkippedUnskinnedMesh(node_index=node_index, mesh_index=mesh_index))
-            warnings.append(f"Node {node_index} mesh {mesh_index} has no skin; skipped convert.")
+            if not config.unskinned_meshes.enabled:
+                skipped_unskinned_meshes.append(
+                    SkippedUnskinnedMesh(node_index=node_index, mesh_index=mesh_index, reason="disabled")
+                )
+                warnings.append(f"Node {node_index} mesh {mesh_index} has no skin; skipped convert.")
+                continue
+
+            node_world = world_matrices.get(node_index, identity_matrix())
+            before_count = len(assigned_unskinned_meshes)
+            before_skipped_count = len(skipped_unskinned_meshes)
+            node_name = node.get("name") if isinstance(node.get("name"), str) else None
+            mesh_name = meshes[mesh_index].get("name") if isinstance(meshes[mesh_index].get("name"), str) else None
+            for primitive_index, primitive in enumerate(meshes[mesh_index].get("primitives", [])):
+                material_name = primitive_material_name(gltf.get("materials", []), primitive.get("material"))
+                ignore_reason = ignored_unskinned_primitive_reason(
+                    config.unskinned_meshes,
+                    node_name,
+                    mesh_name,
+                    material_name,
+                )
+                if ignore_reason is not None:
+                    skipped_unskinned_meshes.append(
+                        SkippedUnskinnedMesh(
+                            node_index=node_index,
+                            mesh_index=mesh_index,
+                            primitive_index=primitive_index,
+                            reason=ignore_reason,
+                        )
+                    )
+                    continue
+                assignment = collect_unskinned_primitive_cuboids(
+                    gltf,
+                    input_path,
+                    binary_chunk,
+                    buffer_cache,
+                    accessors,
+                    primitive,
+                    node_world,
+                    node_index,
+                    mesh_index,
+                    primitive_index,
+                    gltf.get("materials", []),
+                    config.unskinned_meshes,
+                    parent_map,
+                    bone_resolution.resolved_bones,
+                    bones,
+                    world_matrices,
+                    scratch_report,
+                    accumulators,
+                    regular_faces_by_part,
+                )
+                if assignment is not None:
+                    assigned_unskinned_meshes.append(assignment)
+            if len(assigned_unskinned_meshes) == before_count and len(skipped_unskinned_meshes) == before_skipped_count:
+                skipped_unskinned_meshes.append(
+                    SkippedUnskinnedMesh(
+                        node_index=node_index,
+                        mesh_index=mesh_index,
+                        reason="no_convertible_or_assignable_primitives",
+                    )
+                )
             continue
         if not is_valid_index(skins, skin_index):
             warnings.append(f"Node {node_index} references missing skin {skin_index}; skipped convert.")
@@ -369,6 +450,7 @@ def convert_model(
     complex_split_report.extend(
         apply_regular_detail_split(accumulators, regular_faces_by_part, bones, mode, config.hybrid_detail_split)
     )
+    apply_explicit_face_feature_visibility_protection(accumulators)
     complex_split_report.extend(apply_auto_spatial_split(accumulators, regular_faces_by_part, bones, mode))
     cleanup_report = apply_cleanup(accumulators, bones, config.cleanup, warnings, regular_faces_by_part)
     populated = {
@@ -377,7 +459,7 @@ def convert_model(
         if accumulator.min_xyz is not None and accumulator.max_xyz is not None and accumulator.faces > 0
     }
     if not populated:
-        raise ConvertError("no skinned triangle faces could be converted into cuboids")
+        raise ConvertError("no triangle faces could be converted into cuboids")
 
     model_min, model_max = combined_bbox(populated.values())
     scale, offset = compute_scale_and_offset(model_min, model_max, target_height, warnings)
@@ -414,6 +496,8 @@ def convert_model(
         oriented_cubes=oriented_cube_report,
         hybrid=hybrid_report,
         hybrid_detail_split=config.hybrid_detail_split,
+        unskinned_meshes=config.unskinned_meshes,
+        assigned_unskinned_meshes=assigned_unskinned_meshes,
         skipped_unskinned_meshes=skipped_unskinned_meshes,
         warnings=warnings,
     )
@@ -552,6 +636,197 @@ def collect_primitive_cuboids(
         part_key = PartKey(owner, bone.name)
         regular_faces_by_part.setdefault(part_key, []).append(split_face)
         accumulators.setdefault(part_key, BBoxAccumulator()).add_face(points, vertex_keys)
+
+
+def collect_unskinned_primitive_cuboids(
+    gltf: dict[str, Any],
+    path: Path,
+    binary_chunk: bytes | None,
+    buffer_cache: dict[int, bytes],
+    accessors: list[dict[str, Any]],
+    primitive: dict[str, Any],
+    node_world: list[list[float]],
+    node_index: int,
+    mesh_index: int,
+    primitive_index: int,
+    materials: list[dict[str, Any]],
+    unskinned_meshes: UnskinnedMeshesConfig,
+    parent_map: dict[int, int],
+    resolved_bones: dict[int, int],
+    bones: dict[int, BonePartition],
+    world_matrices: dict[int, list[list[float]]],
+    report: PartitionReport,
+    accumulators: dict[PartKey, BBoxAccumulator],
+    regular_faces_by_part: dict[PartKey, list[SplitFace]],
+) -> AssignedUnskinnedMesh | None:
+    attributes = primitive.get("attributes", {})
+    position_accessor = attributes.get("POSITION")
+    if not is_valid_index(accessors, position_accessor):
+        report.warnings.append(
+            f"Mesh {mesh_index} primitive {primitive_index} has no valid POSITION accessor; skipped convert."
+        )
+        return None
+
+    vertex_count = int(accessors[position_accessor].get("count", 0))
+    mode = int(primitive.get("mode", MODE_TRIANGLES))
+    if mode not in {MODE_TRIANGLES, MODE_TRIANGLE_STRIP, MODE_TRIANGLE_FAN}:
+        report.warnings.append(
+            f"Mesh {mesh_index} primitive {primitive_index} uses non-triangle mode {mode}; skipped convert."
+        )
+        return None
+
+    try:
+        raw_positions = read_accessor(gltf, path, binary_chunk, buffer_cache, position_accessor)
+    except InspectError as exc:
+        report.warnings.append(
+            f"Mesh {mesh_index} primitive {primitive_index} could not read POSITION accessor "
+            f"{position_accessor}: {exc}; skipped convert."
+        )
+        return None
+
+    if raw_positions is None:
+        report.warnings.append(
+            f"Mesh {mesh_index} primitive {primitive_index} POSITION accessor has no buffer data; skipped convert."
+        )
+        return None
+
+    positions = [transform_point(node_world, row_to_vec3(row)) for row in raw_positions[:vertex_count]]
+    faces = read_faces(
+        gltf,
+        path,
+        binary_chunk,
+        buffer_cache,
+        accessors,
+        primitive,
+        vertex_count,
+        report,
+        mesh_index,
+        primitive_index,
+    )
+    if not faces:
+        return None
+
+    owner, reason = choose_unskinned_mesh_owner(
+        unskinned_meshes.strategy,
+        node_index,
+        positions,
+        parent_map,
+        resolved_bones,
+        bones,
+        world_matrices,
+    )
+    if owner is None or reason is None:
+        report.warnings.append(
+            f"Node {node_index} mesh {mesh_index} primitive {primitive_index} has no skin and could not be "
+            f"assigned by unskinned_meshes.strategy={unskinned_meshes.strategy!r}; skipped convert."
+        )
+        return None
+
+    bone = bones[owner]
+    part_name = f"{bone.name}_unskinned_{node_index}_{mesh_index}_{primitive_index}"
+    part_key = PartKey(owner, part_name)
+    accumulator = accumulators.setdefault(part_key, BBoxAccumulator())
+    primitive_key = f"unskinned-node={node_index}/mesh={mesh_index}/primitive={primitive_index}"
+    material_name = primitive_material_name(materials, primitive.get("material"))
+    assigned_faces = 0
+    assigned_vertices: set[tuple[str, int]] = set()
+    for face in faces:
+        points: list[list[float]] = []
+        vertex_keys: list[tuple[str, int]] = []
+        for vertex_index in face:
+            if 0 <= vertex_index < len(positions):
+                points.append(positions[vertex_index])
+                vertex_key = (primitive_key, vertex_index)
+                vertex_keys.append(vertex_key)
+                assigned_vertices.add(vertex_key)
+        if not points:
+            continue
+        split_face = SplitFace(
+            owner_bone=owner,
+            bone_name=bone.name,
+            points=points,
+            vertex_keys=vertex_keys,
+            material_name=material_name,
+        )
+        regular_faces_by_part.setdefault(part_key, []).append(split_face)
+        accumulator.add_face(points, vertex_keys)
+        assigned_faces += 1
+
+    if assigned_faces == 0:
+        return None
+    return AssignedUnskinnedMesh(
+        node_index=node_index,
+        mesh_index=mesh_index,
+        primitive_index=primitive_index,
+        owner_bone=owner,
+        owner_bone_name=bone.name,
+        part_name=part_name,
+        strategy=unskinned_meshes.strategy,
+        reason=reason,
+        faces=assigned_faces,
+        vertices=len(assigned_vertices),
+    )
+
+
+def choose_unskinned_mesh_owner(
+    strategy: str,
+    node_index: int,
+    positions: list[list[float]],
+    parent_map: dict[int, int],
+    resolved_bones: dict[int, int],
+    bones: dict[int, BonePartition],
+    world_matrices: dict[int, list[list[float]]],
+) -> tuple[int | None, str | None]:
+    if strategy in {"node_parent", "node_parent_then_nearest"}:
+        owner = nearest_resolved_ancestor_bone(node_index, parent_map, resolved_bones, bones)
+        if owner is not None:
+            return owner, "node_parent"
+    if strategy in {"nearest_bone", "node_parent_then_nearest"}:
+        owner = nearest_bone_to_points(positions, bones, world_matrices)
+        if owner is not None:
+            return owner, "nearest_bone"
+    return None, None
+
+
+def nearest_resolved_ancestor_bone(
+    node_index: int,
+    parent_map: dict[int, int],
+    resolved_bones: dict[int, int],
+    bones: dict[int, BonePartition],
+) -> int | None:
+    current: int | None = node_index
+    seen: set[int] = set()
+    while current is not None and current not in seen:
+        seen.add(current)
+        owner = resolved_bones.get(current)
+        if owner in bones:
+            return owner
+        current = parent_map.get(current)
+    return None
+
+
+def nearest_bone_to_points(
+    positions: list[list[float]],
+    bones: dict[int, BonePartition],
+    world_matrices: dict[int, list[list[float]]],
+) -> int | None:
+    if not positions or not bones:
+        return None
+    min_xyz, max_xyz = points_bbox(positions)
+    center = [(min_xyz[index] + max_xyz[index]) * 0.5 for index in range(3)]
+    return min(
+        bones,
+        key=lambda bone_index: (
+            squared_distance(center, matrix_translation(world_matrices.get(bone_index, identity_matrix()))),
+            bone_index,
+        ),
+    )
+
+
+def squared_distance(left: list[float], right: list[float]) -> float:
+    return sum((left[index] - right[index]) ** 2 for index in range(3))
+
+
 def apply_complex_split_override(
     config: ProcessingConfig, requested_bones: tuple[str, ...] | list[str]
 ) -> ProcessingConfig:
@@ -593,6 +868,52 @@ def primitive_material_name(materials: list[dict[str, Any]], material_index: Any
         return None
     name = materials[material_index].get("name")
     return name if isinstance(name, str) and name else None
+
+
+def ignored_unskinned_primitive_reason(
+    config: UnskinnedMeshesConfig,
+    node_name: str | None,
+    mesh_name: str | None,
+    material_name: str | None,
+) -> str | None:
+    reason = unskinned_name_match_reason(
+        material_name,
+        config.ignore_material_name_contains,
+        config.case_sensitive,
+        "material_name_contains",
+    )
+    if reason is not None:
+        return reason
+    reason = unskinned_name_match_reason(
+        node_name,
+        config.ignore_node_name_contains,
+        config.case_sensitive,
+        "node_name_contains",
+    )
+    if reason is not None:
+        return reason
+    return unskinned_name_match_reason(
+        mesh_name,
+        config.ignore_mesh_name_contains,
+        config.case_sensitive,
+        "mesh_name_contains",
+    )
+
+
+def unskinned_name_match_reason(
+    name: str | None,
+    patterns: tuple[str, ...],
+    case_sensitive: bool,
+    reason_prefix: str,
+) -> str | None:
+    if name is None:
+        return None
+    haystack = name if case_sensitive else name.casefold()
+    for pattern in patterns:
+        needle = pattern if case_sensitive else pattern.casefold()
+        if needle and needle in haystack:
+            return f"ignored_{reason_prefix}:{pattern}"
+    return None
 
 
 def extract_vrm_humanoid_nodes(gltf: dict[str, Any], resolved_bones: dict[int, int]) -> dict[str, set[int]]:
@@ -697,6 +1018,12 @@ def apply_head_complex_split(
         config,
     )
     explicit_face_feature_bbox = explicit_face_feature_accumulators_bbox(accumulators, owner_bone, owner_bbox)
+    explicit_face_feature_protection_bbox = explicit_face_feature_visibility_bbox(
+        accumulators,
+        owner_bone,
+        owner_bbox,
+        front_sign,
+    ) or explicit_face_feature_bbox
     suppress_material_face_features = explicit_face_feature_bbox is not None
     largest_component = tuple(component_indices[0]) if component_indices else ()
     report_accumulators: dict[str, BBoxAccumulator] = {}
@@ -850,6 +1177,15 @@ def apply_head_complex_split(
         owner_bbox,
         front_sign,
     )
+    if explicit_face_feature_protection_bbox is not None:
+        protect_explicit_face_feature_visibility(
+            owner_bone,
+            accumulators,
+            report_accumulators,
+            explicit_face_feature_protection_bbox,
+            owner_bbox,
+            front_sign,
+        )
 
     subparts = [
         ComplexSplitSubpartReport(
@@ -1869,8 +2205,64 @@ def explicit_face_feature_accumulators_bbox(
     accumulators: dict[PartKey, BBoxAccumulator],
     owner_bone: int,
     owner_bbox: tuple[list[float], list[float]],
+    *,
+    significant_only: bool = False,
 ) -> tuple[list[float], list[float]] | None:
-    feature_accumulators = [
+    feature_accumulators = explicit_face_feature_accumulators(
+        accumulators,
+        owner_bone,
+        owner_bbox,
+        significant_only=significant_only,
+    )
+    if not feature_accumulators:
+        return None
+    return combined_bbox(feature_accumulators)
+
+
+def explicit_face_feature_visibility_bbox(
+    accumulators: dict[PartKey, BBoxAccumulator],
+    owner_bone: int,
+    owner_bbox: tuple[list[float], list[float]],
+    front_sign: int,
+) -> tuple[list[float], list[float]] | None:
+    feature_accumulators = explicit_face_feature_accumulators(
+        accumulators,
+        owner_bone,
+        owner_bbox,
+        significant_only=True,
+    ) or explicit_face_feature_accumulators(
+        accumulators,
+        owner_bone,
+        owner_bbox,
+        significant_only=False,
+    )
+    if not feature_accumulators:
+        return None
+
+    min_xyz, max_xyz = combined_bbox(feature_accumulators)
+    depth_values = sorted(
+        point[2]
+        for accumulator in feature_accumulators
+        for point in (list(accumulator.points_by_vertex.values()) or bbox_corners(accumulator.min_xyz, accumulator.max_xyz))
+    )
+    if depth_values:
+        owner_min, owner_max = owner_bbox
+        owner_depth = max(owner_max[2] - owner_min[2], EPSILON)
+        if front_sign >= 0:
+            min_xyz[2] = max(min_xyz[2], feature_visibility_depth_value(depth_values, front_sign, owner_depth))
+        else:
+            max_xyz[2] = min(max_xyz[2], feature_visibility_depth_value(depth_values, front_sign, owner_depth))
+    return min_xyz, max_xyz
+
+
+def explicit_face_feature_accumulators(
+    accumulators: dict[PartKey, BBoxAccumulator],
+    owner_bone: int,
+    owner_bbox: tuple[list[float], list[float]],
+    *,
+    significant_only: bool,
+) -> list[BBoxAccumulator]:
+    return [
         accumulator
         for part_key, accumulator in accumulators.items()
         if part_key.owner_bone != owner_bone
@@ -1878,10 +2270,37 @@ def explicit_face_feature_accumulators_bbox(
         and accumulator.min_xyz is not None
         and accumulator.max_xyz is not None
         and accumulator_center_near_bbox(accumulator, owner_bbox)
+        and (not significant_only or accumulator.faces >= FACE_FEATURE_PROTECTION_MIN_FACES)
     ]
-    if not feature_accumulators:
-        return None
-    return combined_bbox(feature_accumulators)
+
+
+def feature_visibility_depth_value(sorted_values: list[float], front_sign: int, owner_depth: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) < 3:
+        return sorted_values[0] if front_sign >= 0 else sorted_values[-1]
+
+    gap_threshold = max(owner_depth * 0.05, MIN_CUBE_SIZE * 4.0)
+    scan_count = max(1, int((len(sorted_values) - 1) * 0.35))
+    if front_sign >= 0:
+        best_index = 0
+        best_gap = 0.0
+        for index in range(scan_count):
+            gap = sorted_values[index + 1] - sorted_values[index]
+            if gap > best_gap:
+                best_gap = gap
+                best_index = index + 1
+        return sorted_values[best_index] if best_gap >= gap_threshold else sorted_values[0]
+
+    best_index = len(sorted_values) - 1
+    best_gap = 0.0
+    start = max(0, len(sorted_values) - 1 - scan_count)
+    for index in range(len(sorted_values) - 2, start - 1, -1):
+        gap = sorted_values[index + 1] - sorted_values[index]
+        if gap > best_gap:
+            best_gap = gap
+            best_index = index
+    return sorted_values[best_index] if best_gap >= gap_threshold else sorted_values[-1]
 
 
 def accumulator_center_near_bbox(
@@ -1951,6 +2370,151 @@ def split_head_core_parts(
             accumulator.add_face(face.points, face.vertex_keys)
             report_accumulator.add_face(face.points, face.vertex_keys)
         report_methods[part_name] = "spatial_region"
+
+
+def protect_explicit_face_feature_visibility(
+    owner_bone: int,
+    accumulators: dict[PartKey, BBoxAccumulator],
+    report_accumulators: dict[str, BBoxAccumulator] | None,
+    feature_bbox: tuple[list[float], list[float]],
+    owner_bbox: tuple[list[float], list[float]],
+    front_sign: int,
+) -> None:
+    feature_min, feature_max = feature_bbox
+    owner_min, owner_max = owner_bbox
+    owner_dimensions = bbox_dimensions(owner_min, owner_max)
+    depth_margin = max(owner_dimensions[2] * FACE_FEATURE_PROTECTION_MARGIN_RATIO, EPSILON)
+    height_margin = max(owner_dimensions[1] * FACE_FEATURE_PROTECTION_MARGIN_RATIO, EPSILON)
+
+    for part_key, accumulator in list(accumulators.items()):
+        if part_key.owner_bone != owner_bone:
+            continue
+        if accumulator.min_xyz is None or accumulator.max_xyz is None:
+            continue
+
+        report_accumulator = report_accumulators.get(part_key.name) if report_accumulators is not None else None
+        if part_key.name == "head_core" or part_key.name.startswith("head_core_front"):
+            if clamp_front_axis_behind_features(accumulator, feature_min, feature_max, depth_margin, front_sign):
+                if report_accumulator is not None:
+                    clamp_front_axis_behind_features(report_accumulator, feature_min, feature_max, depth_margin, front_sign)
+            continue
+
+        if part_key.name.startswith("hair_front") and accumulator_overlaps_bbox_axes(accumulator, feature_bbox, (0, 1)):
+            if clamp_hair_above_features(accumulator, feature_max[1] + height_margin):
+                if report_accumulator is not None:
+                    clamp_hair_above_features(report_accumulator, feature_max[1] + height_margin)
+
+
+def apply_explicit_face_feature_visibility_protection(accumulators: dict[PartKey, BBoxAccumulator]) -> None:
+    owner_bones = {
+        part_key.owner_bone
+        for part_key, accumulator in accumulators.items()
+        if accumulator.min_xyz is not None
+        and accumulator.max_xyz is not None
+        and is_head_visibility_part_name(part_key.name)
+    }
+    for owner_bone in sorted(owner_bones):
+        owner_accumulators = [
+            accumulator
+            for part_key, accumulator in accumulators.items()
+            if part_key.owner_bone == owner_bone
+            and accumulator.min_xyz is not None
+            and accumulator.max_xyz is not None
+        ]
+        if not owner_accumulators:
+            continue
+        owner_bbox = combined_bbox(owner_accumulators)
+        raw_feature_bbox = explicit_face_feature_accumulators_bbox(accumulators, owner_bone, owner_bbox)
+        if raw_feature_bbox is None:
+            continue
+        front_sign = infer_face_feature_front_sign(owner_bbox, raw_feature_bbox)
+        feature_bbox = explicit_face_feature_visibility_bbox(
+            accumulators,
+            owner_bone,
+            owner_bbox,
+            front_sign,
+        ) or raw_feature_bbox
+        protect_explicit_face_feature_visibility(
+            owner_bone,
+            accumulators,
+            None,
+            feature_bbox,
+            owner_bbox,
+            front_sign,
+        )
+
+
+def is_head_visibility_part_name(name: str) -> bool:
+    return name == "head_core" or name.startswith("head_core_front") or name.startswith("hair_front")
+
+
+def infer_face_feature_front_sign(
+    owner_bbox: tuple[list[float], list[float]],
+    feature_bbox: tuple[list[float], list[float]],
+) -> int:
+    owner_min, owner_max = owner_bbox
+    feature_min, feature_max = feature_bbox
+    owner_center_z = (owner_min[2] + owner_max[2]) * 0.5
+    feature_center_z = (feature_min[2] + feature_max[2]) * 0.5
+    return 1 if feature_center_z >= owner_center_z else -1
+
+
+def clamp_front_axis_behind_features(
+    accumulator: BBoxAccumulator,
+    feature_min: list[float],
+    feature_max: list[float],
+    margin: float,
+    front_sign: int,
+) -> bool:
+    if accumulator.min_xyz is None or accumulator.max_xyz is None:
+        return False
+    changed = False
+    if front_sign >= 0:
+        target_max = feature_min[2] - margin
+        if accumulator.min_xyz[2] < target_max and abs(accumulator.max_xyz[2] - target_max) > EPSILON:
+            accumulator.max_xyz[2] = target_max
+            changed = True
+    else:
+        target_min = feature_max[2] + margin
+        if accumulator.max_xyz[2] > target_min and abs(accumulator.min_xyz[2] - target_min) > EPSILON:
+            accumulator.min_xyz[2] = target_min
+            changed = True
+    if changed:
+        reset_accumulator_points_to_bbox(accumulator, "face_feature_protected")
+    return changed
+
+
+def clamp_hair_above_features(accumulator: BBoxAccumulator, min_y: float) -> bool:
+    if accumulator.min_xyz is None or accumulator.max_xyz is None:
+        return False
+    if accumulator.min_xyz[1] >= min_y or accumulator.max_xyz[1] <= min_y:
+        return False
+    accumulator.min_xyz[1] = min_y
+    reset_accumulator_points_to_bbox(accumulator, "face_feature_protected")
+    return True
+
+
+def accumulator_overlaps_bbox_axes(
+    accumulator: BBoxAccumulator,
+    bbox: tuple[list[float], list[float]],
+    axes: tuple[int, ...],
+) -> bool:
+    if accumulator.min_xyz is None or accumulator.max_xyz is None:
+        return False
+    min_xyz, max_xyz = bbox
+    for axis in axes:
+        if accumulator.max_xyz[axis] < min_xyz[axis] or accumulator.min_xyz[axis] > max_xyz[axis]:
+            return False
+    return True
+
+
+def reset_accumulator_points_to_bbox(accumulator: BBoxAccumulator, key_prefix: str) -> None:
+    if accumulator.min_xyz is None or accumulator.max_xyz is None:
+        return
+    accumulator.points_by_vertex = {
+        (key_prefix, index): point.copy()
+        for index, point in enumerate(bbox_corners(accumulator.min_xyz, accumulator.max_xyz))
+    }
 
 
 def head_core_depth_suffixes(front_sign: int) -> list[str]:
@@ -3075,10 +3639,17 @@ def convert_result_to_dict(result: ConvertResult) -> dict[str, Any]:
             "merged_small_parts": len(result.cleanup.merged_parts),
             "kept_small_parts": len(result.cleanup.kept_small_parts),
             "oriented_cubes": len(result.oriented_cubes),
+            "assigned_unskinned_meshes": len(result.assigned_unskinned_meshes),
+            "skipped_unskinned_meshes": len(result.skipped_unskinned_meshes),
         },
         "bone_resolution": bone_resolution_to_dict(result.bone_resolution),
         "hybrid": hybrid_to_dict(result.hybrid),
         "hybrid_detail_split": hybrid_detail_split_to_dict(result.hybrid_detail_split),
+        "unskinned_meshes": unskinned_meshes_to_dict(
+            result.unskinned_meshes,
+            result.assigned_unskinned_meshes,
+            result.skipped_unskinned_meshes,
+        ),
         "complex_split": [complex_split_to_dict(item) for item in result.complex_split],
         "cleanup": cleanup_to_dict(result.cleanup),
         "oriented_cubes": [oriented_cube_to_dict(item) for item in result.oriented_cubes],
@@ -3108,6 +3679,47 @@ def hybrid_detail_split_to_dict(item: HybridDetailSplitConfig) -> dict[str, Any]
         "min_material_ratio": item.min_material_ratio,
         "min_component_faces": item.min_component_faces,
         "min_component_ratio": item.min_component_ratio,
+    }
+
+
+def unskinned_meshes_to_dict(
+    config: UnskinnedMeshesConfig,
+    assigned: list[AssignedUnskinnedMesh],
+    skipped: list[SkippedUnskinnedMesh],
+) -> dict[str, Any]:
+    return {
+        "enabled": config.enabled,
+        "strategy": config.strategy,
+        "ignore_material_name_contains": list(config.ignore_material_name_contains),
+        "ignore_node_name_contains": list(config.ignore_node_name_contains),
+        "ignore_mesh_name_contains": list(config.ignore_mesh_name_contains),
+        "case_sensitive": config.case_sensitive,
+        "assigned": [assigned_unskinned_mesh_to_dict(item) for item in assigned],
+        "skipped": [skipped_unskinned_mesh_to_dict(item) for item in skipped],
+    }
+
+
+def assigned_unskinned_mesh_to_dict(item: AssignedUnskinnedMesh) -> dict[str, Any]:
+    return {
+        "node_index": item.node_index,
+        "mesh_index": item.mesh_index,
+        "primitive_index": item.primitive_index,
+        "owner_bone": item.owner_bone,
+        "owner_bone_name": item.owner_bone_name,
+        "part_name": item.part_name,
+        "strategy": item.strategy,
+        "reason": item.reason,
+        "faces": item.faces,
+        "vertices": item.vertices,
+    }
+
+
+def skipped_unskinned_mesh_to_dict(item: SkippedUnskinnedMesh) -> dict[str, Any]:
+    return {
+        "node_index": item.node_index,
+        "mesh_index": item.mesh_index,
+        "primitive_index": item.primitive_index,
+        "reason": item.reason,
     }
 
 
@@ -3250,6 +3862,7 @@ def skipped_unskinned_meshes_summary_to_dict(items: list[SkippedUnskinnedMesh]) 
         "count": len(items),
         "node_indices": sorted({item.node_index for item in items}),
         "mesh_indices": sorted({item.mesh_index for item in items}),
+        "reasons": sorted({item.reason for item in items}),
     }
 
 
@@ -3335,6 +3948,7 @@ def format_convert_summary(result: ConvertResult) -> str:
         f"Cleanup deleted parts: {len(result.cleanup.deleted_parts)}",
         f"Cleanup merged parts: {len(result.cleanup.merged_parts)}",
         f"Oriented cubes: {len(result.oriented_cubes)}",
+        f"Unskinned meshes: {len(result.assigned_unskinned_meshes)} assigned / {len(result.skipped_unskinned_meshes)} skipped",
         f"Output: {result.output_path}",
     ]
     if result.warnings:

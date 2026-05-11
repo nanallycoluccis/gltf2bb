@@ -189,6 +189,75 @@ class ConvertModelTest(unittest.TestCase):
         self.assertIn("no rotation", elongated["reason"])
         self.assertEqual(quality["tiny_fragment_cubes"], [])
 
+    def test_unskinned_meshes_can_assign_by_node_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "unskinned_parent.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            config_path = Path(temp_dir) / "config.json"
+            write_unskinned_parent_fixture(model_path)
+            config_path.write_text(
+                json.dumps({"unskinned_meshes": {"enabled": True, "strategy": "node_parent"}}),
+                encoding="utf-8",
+            )
+
+            result = convert_model(
+                model_path,
+                output_path,
+                target_height=4.0,
+                config_path=config_path,
+                report_path=report_path,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(result.assigned_unskinned_meshes), 1)
+        self.assertEqual(result.skipped_unskinned_meshes, [])
+        self.assertEqual(
+            {element["name"] for element in data["elements"]},
+            {"root_joint_cube", "child_joint_unskinned_3_1_0_cube"},
+        )
+
+        assigned = report["unskinned_meshes"]["assigned"][0]
+        self.assertTrue(report["unskinned_meshes"]["enabled"])
+        self.assertEqual(assigned["owner_bone_name"], "child_joint")
+        self.assertEqual(assigned["part_name"], "child_joint_unskinned_3_1_0")
+        self.assertEqual(assigned["reason"], "node_parent")
+        self.assertEqual(report["totals"]["assigned_unskinned_meshes"], 1)
+        self.assertEqual(report["quality"]["skipped_unskinned_meshes_summary"]["count"], 0)
+
+    def test_unskinned_meshes_skip_default_ignored_helper_materials(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "unskinned_helper_material.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            config_path = Path(temp_dir) / "config.json"
+            write_unskinned_parent_fixture(model_path, ignored_static_material=True)
+            config_path.write_text(
+                json.dumps({"unskinned_meshes": {"enabled": True, "strategy": "node_parent_then_nearest"}}),
+                encoding="utf-8",
+            )
+
+            result = convert_model(
+                model_path,
+                output_path,
+                target_height=4.0,
+                config_path=config_path,
+                report_path=report_path,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.assigned_unskinned_meshes, [])
+        self.assertEqual(len(result.skipped_unskinned_meshes), 1)
+        self.assertEqual([element["name"] for element in data["elements"]], ["root_joint_cube"])
+
+        skipped = report["unskinned_meshes"]["skipped"][0]
+        self.assertEqual(skipped["primitive_index"], 0)
+        self.assertEqual(skipped["reason"], "ignored_material_name_contains:mmd_tools_rigid")
+        self.assertEqual(report["totals"]["assigned_unskinned_meshes"], 0)
+        self.assertEqual(report["totals"]["skipped_unskinned_meshes"], 1)
+
     def test_complex_split_head_outputs_subpart_cubes_under_head_group(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = Path(temp_dir) / "complex_head.gltf"
@@ -338,6 +407,35 @@ class ConvertModelTest(unittest.TestCase):
         subparts = {subpart["name"] for subpart in report["complex_split"][0]["subparts"]}
         self.assertFalse({"eye_l", "eye_r", "mouth"} & subparts)
         self.assertFalse(any(name.startswith("head_core_front") and name.endswith("_face") for name in subparts))
+
+    def test_explicit_face_features_limit_head_core_and_front_hair_depth(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "explicit_eye_front_hair.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            write_explicit_eye_head_fixture(model_path, include_front_hair=True)
+
+            convert_model(
+                model_path,
+                output_path,
+                target_height=4.0,
+                complex_split=("head",),
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+
+        elements = {element["name"]: element for element in data["elements"]}
+        eye_elements = [element for name, element in elements.items() if name.startswith("目.")]
+        head_front_elements = [element for name, element in elements.items() if name.startswith("head_core_front")]
+        hair_front_elements = [element for name, element in elements.items() if name.startswith("hair_front")]
+
+        self.assertTrue(eye_elements)
+        self.assertTrue(head_front_elements)
+        self.assertTrue(hair_front_elements)
+
+        eye_min_z = min(element["from"][2] for element in eye_elements)
+        eye_max_y = max(element["to"][1] for element in eye_elements)
+        self.assertTrue(all(element["to"][2] < eye_min_z for element in head_front_elements))
+        self.assertLess(eye_min_z - max(element["to"][2] for element in head_front_elements), 0.05)
+        self.assertTrue(all(element["from"][1] > eye_max_y for element in hair_front_elements))
 
     def test_complex_split_merges_tiny_connected_components_to_nearest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1001,6 +1099,86 @@ def write_quality_diagnostics_fixture(path: Path) -> None:
     path.write_text(json.dumps(model), encoding="utf-8")
 
 
+def write_unskinned_parent_fixture(path: Path, ignored_static_material: bool = False) -> None:
+    skinned_positions = b"".join(
+        struct.pack("<fff", *point)
+        for point in [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ]
+    )
+    joints = bytes([0, 0, 0, 0] * 3)
+    weights = b"".join(struct.pack("<ffff", 1.0, 0.0, 0.0, 0.0) for _ in range(3))
+    static_positions = b"".join(
+        struct.pack("<fff", *point)
+        for point in [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ]
+    )
+    payload = base64.b64encode(skinned_positions + joints + weights + static_positions).decode("ascii")
+    static_offset = len(skinned_positions) + len(joints) + len(weights)
+    model = {
+        "asset": {"version": "2.0", "generator": "gltf2bb unskinned parent convert test"},
+        "scene": 0,
+        "scenes": [{"nodes": [0, 2]}],
+        "nodes": [
+            {"name": "root_joint", "children": [1]},
+            {"name": "child_joint", "translation": [0.0, 1.0, 0.0], "children": [3]},
+            {"name": "skinned_mesh_node", "mesh": 0, "skin": 0},
+            {"name": "static_mesh_node", "mesh": 1},
+        ],
+        "skins": [{"joints": [0, 1]}],
+        "meshes": [
+            {
+                "name": "skinned_triangle",
+                "primitives": [
+                    {
+                        "attributes": {"POSITION": 0, "JOINTS_0": 1, "WEIGHTS_0": 2},
+                        "mode": 4,
+                    }
+                ],
+            },
+            {
+                "name": "static_triangle",
+                "primitives": [
+                    {
+                        "attributes": {"POSITION": 3},
+                        **({"material": 0} if ignored_static_material else {}),
+                        "mode": 4,
+                    }
+                ],
+            },
+        ],
+        **({"materials": [{"name": "mmd_tools_rigid_0"}]} if ignored_static_material else {}),
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"},
+            {"bufferView": 1, "componentType": 5121, "count": 3, "type": "VEC4"},
+            {"bufferView": 2, "componentType": 5126, "count": 3, "type": "VEC4"},
+            {"bufferView": 3, "componentType": 5126, "count": 3, "type": "VEC3"},
+        ],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": len(skinned_positions)},
+            {"buffer": 0, "byteOffset": len(skinned_positions), "byteLength": len(joints)},
+            {
+                "buffer": 0,
+                "byteOffset": len(skinned_positions) + len(joints),
+                "byteLength": len(weights),
+            },
+            {"buffer": 0, "byteOffset": static_offset, "byteLength": len(static_positions)},
+        ],
+        "buffers": [
+            {
+                "byteLength": len(skinned_positions) + len(joints) + len(weights) + len(static_positions),
+                "uri": f"data:application/octet-stream;base64,{payload}",
+            }
+        ],
+    }
+    path.write_text(json.dumps(model), encoding="utf-8")
+
+
 def write_near_planar_triangle_fixture(path: Path) -> None:
     positions = b"".join(
         struct.pack("<fff", *point)
@@ -1334,7 +1512,7 @@ def write_large_head_core_with_face_features_fixture(path: Path, include_front_h
     path.write_text(json.dumps(model), encoding="utf-8")
 
 
-def write_explicit_eye_head_fixture(path: Path) -> None:
+def write_explicit_eye_head_fixture(path: Path, include_front_hair: bool = False) -> None:
     def repeated_triangle(points: list[tuple[float, float, float]], count: int) -> list[tuple[float, float, float]]:
         result: list[tuple[float, float, float]] = []
         for _ in range(count):
@@ -1383,6 +1561,8 @@ def write_explicit_eye_head_fixture(path: Path) -> None:
     add_primitive([(-0.2, 1.32, 1.05), (0.2, 1.32, 1.05), (0.0, 1.38, 1.05)], 1, 2)
     add_primitive([(-0.55, 1.58, 1.2), (-0.3, 1.58, 1.2), (-0.425, 1.68, 1.2)], 2, 1)
     add_primitive([(0.3, 1.58, 1.2), (0.55, 1.58, 1.2), (0.425, 1.68, 1.2)], 3, 1)
+    if include_front_hair:
+        add_primitive(repeated_triangle([(-1.2, 1.2, 1.25), (1.2, 1.2, 1.25), (0.0, 2.45, 1.25)], 260), 1, 3)
 
     payload_bytes = b"".join(chunks)
     payload = base64.b64encode(payload_bytes).decode("ascii")
@@ -1398,7 +1578,12 @@ def write_explicit_eye_head_fixture(path: Path) -> None:
             {"name": "mesh_node", "mesh": 0, "skin": 0},
         ],
         "skins": [{"joints": [0, 1, 2, 3]}],
-        "materials": [{"name": "face_skin"}, {"name": "eye material"}, {"name": "mouth material"}],
+        "materials": [
+            {"name": "face_skin"},
+            {"name": "eye material"},
+            {"name": "mouth material"},
+            *([{"name": "front hair"}] if include_front_hair else []),
+        ],
         "meshes": [{"name": "explicit_eye_head", "primitives": primitives}],
         "accessors": accessors,
         "bufferViews": buffer_views,
