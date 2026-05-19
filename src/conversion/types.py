@@ -106,6 +106,12 @@ class ComplexSplitBoneReport:
     deleted_tiny_components: int = 0
     merged_tiny_hair_buckets: int = 0
     expanded_hair_bucket_overlap: int = 0
+    original_cube_dimensions: list[float] = field(default_factory=list)
+    split_method: str | None = None
+    requested_subpart_count: int = 0
+    budget_limit: int | None = None
+    budget_status: str = "not_applicable"
+    budget_reason: str | None = None
 
 
 @dataclass

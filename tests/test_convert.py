@@ -898,10 +898,51 @@ class ConvertModelTest(unittest.TestCase):
             data = json.loads(output_path.read_text(encoding="utf-8"))
             report = json.loads(report_path.read_text(encoding="utf-8"))
 
-        self.assertGreater(len(result.cubes), 1)
-        self.assertEqual(report["complex_split"][0]["bone_name"], "back_panel")
-        self.assertEqual({subpart["method"] for subpart in report["complex_split"][0]["subparts"]}, {"auto_spatial_grid"})
+        summary = assert_cube_only_bbmodel(self, data)
+        self.assertEqual(len(result.cubes), 2)
+        self.assertEqual(summary["element_count"], 2)
+        split = report["complex_split"][0]
+        self.assertEqual(split["bone_name"], "back_panel")
+        self.assertEqual({subpart["method"] for subpart in split["subparts"]}, {"auto_spatial_grid"})
+        self.assertEqual(split["split_method"], "auto_spatial_grid")
+        self.assertEqual(split["budget_limit"], 2)
+        self.assertEqual(split["budget_status"], "capped")
+        self.assertGreater(split["requested_subpart_count"], split["budget_limit"])
+        self.assertEqual(report["quality"]["split_diagnostics"][0]["original_cube_dimensions"], [8.0, 2.0, 0.0])
         self.assertLess(max(element["to"][0] - element["from"][0] for element in data["elements"]), 16.0)
+        self.assertEqual(report["quality"]["cube_budget_warnings"][0]["reason"], "auto_spatial_split_capped_to_budget")
+
+    def test_hybrid_mode_caps_oversized_split_under_budget_pressure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "budget_pressure_panel.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            write_budget_pressure_panel_fixture(model_path)
+
+            result = convert_model(
+                model_path,
+                output_path,
+                mode="hybrid",
+                target_height=4.0,
+                report_path=report_path,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        summary = assert_cube_only_bbmodel(self, data)
+        self.assertEqual(len(result.cubes), 2)
+        self.assertEqual(summary["element_count"], 2)
+        split = report["complex_split"][0]
+        self.assertEqual(split["bone_name"], "wide_cloth_panel")
+        self.assertEqual(split["budget_status"], "capped")
+        self.assertEqual(split["budget_limit"], 2)
+        self.assertGreater(split["requested_subpart_count"], 2)
+        warning = report["quality"]["cube_budget_warnings"][0]
+        self.assertEqual(warning["owner_bone_name"], "wide_cloth_panel")
+        self.assertEqual(warning["requested_cube_count"], split["requested_subpart_count"])
+        self.assertEqual(warning["cube_count"], 2)
+        self.assertEqual(warning["threshold"], 2)
+        self.assertEqual(warning["reason"], "auto_spatial_split_capped_to_budget")
 
     def test_hybrid_mode_splits_regular_detail_bone_by_material(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2505,6 +2546,66 @@ def write_oversized_back_panel_fixture(path: Path) -> None:
         "meshes": [
             {
                 "name": "oversized_back_panel",
+                "primitives": [
+                    {
+                        "attributes": {"POSITION": 0, "JOINTS_0": 1, "WEIGHTS_0": 2},
+                        "mode": 4,
+                    }
+                ],
+            }
+        ],
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": len(points), "type": "VEC3"},
+            {"bufferView": 1, "componentType": 5121, "count": len(points), "type": "VEC4"},
+            {"bufferView": 2, "componentType": 5126, "count": len(points), "type": "VEC4"},
+        ],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": len(positions)},
+            {"buffer": 0, "byteOffset": len(positions), "byteLength": len(joints)},
+            {"buffer": 0, "byteOffset": len(positions) + len(joints), "byteLength": len(weights)},
+        ],
+        "buffers": [
+            {
+                "byteLength": len(positions) + len(joints) + len(weights),
+                "uri": f"data:application/octet-stream;base64,{payload}",
+            }
+        ],
+    }
+    path.write_text(json.dumps(model), encoding="utf-8")
+
+
+def write_budget_pressure_panel_fixture(path: Path) -> None:
+    points: list[tuple[float, float, float]] = []
+    x_segments = 16
+    y_segments = 4
+    for y_index in range(y_segments):
+        center_y = y_index * 0.5 + 0.25
+        for x_index in range(x_segments):
+            center_x = -4.0 + x_index * 0.5 + 0.25
+            points.extend(
+                [
+                    (center_x - 0.08, center_y - 0.08, 0.0),
+                    (center_x + 0.08, center_y - 0.08, 0.0),
+                    (center_x, center_y + 0.08, 0.0),
+                ]
+            )
+
+    positions = b"".join(struct.pack("<fff", *point) for point in points)
+    joints = bytes([0, 0, 0, 0] * len(points))
+    weights = b"".join(struct.pack("<ffff", 1.0, 0.0, 0.0, 0.0) for _ in points)
+    payload = base64.b64encode(positions + joints + weights).decode("ascii")
+    model = {
+        "asset": {"version": "2.0", "generator": "gltf2bb oversized split budget cap test"},
+        "scene": 0,
+        "scenes": [{"nodes": [1]}],
+        "nodes": [
+            {"name": "wide_cloth_panel"},
+            {"name": "mesh_node", "mesh": 0, "skin": 0},
+        ],
+        "skins": [{"joints": [0]}],
+        "meshes": [
+            {
+                "name": "budget_pressure_panel",
                 "primitives": [
                     {
                         "attributes": {"POSITION": 0, "JOINTS_0": 1, "WEIGHTS_0": 2},

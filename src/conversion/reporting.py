@@ -11,6 +11,7 @@ from ..errors import ConvertError
 from ..partition import bone_resolution_to_dict
 from .bbmodel import rounded_vec
 from .constants import (
+    AUTO_SPATIAL_SPLIT_OWNER_BUDGET_MULTIPLIER,
     EPSILON,
     MIN_CUBE_SIZE,
     QUALITY_ELONGATED_DIMENSION_RATIO,
@@ -193,6 +194,12 @@ def complex_split_to_dict(item: ComplexSplitBoneReport) -> dict[str, Any]:
         "deleted_tiny_components": item.deleted_tiny_components,
         "merged_tiny_hair_buckets": item.merged_tiny_hair_buckets,
         "expanded_hair_bucket_overlap": item.expanded_hair_bucket_overlap,
+        "original_cube_dimensions": rounded_vec(item.original_cube_dimensions) if item.original_cube_dimensions else [],
+        "split_method": item.split_method,
+        "requested_subpart_count": item.requested_subpart_count,
+        "budget_limit": item.budget_limit,
+        "budget_status": item.budget_status,
+        "budget_reason": item.budget_reason,
     }
 
 
@@ -365,6 +372,12 @@ def split_diagnostics_to_dict(result: ConvertResult) -> list[dict[str, Any]]:
             "deleted_tiny_components": item.deleted_tiny_components,
             "merged_tiny_hair_buckets": item.merged_tiny_hair_buckets,
             "expanded_hair_bucket_overlap": item.expanded_hair_bucket_overlap,
+            "original_cube_dimensions": rounded_vec(item.original_cube_dimensions) if item.original_cube_dimensions else [],
+            "split_method": item.split_method,
+            "requested_subpart_count": item.requested_subpart_count,
+            "budget_limit": item.budget_limit,
+            "budget_status": item.budget_status,
+            "budget_reason": item.budget_reason,
         }
         for item in result.complex_split
     ]
@@ -391,6 +404,20 @@ def cube_budget_warnings_to_dict(result: ConvertResult) -> list[dict[str, Any]]:
                     "cube_count": item["cubes"],
                     "threshold": result.cube_owner_budget_warning_threshold,
                     "reason": "owner_cube_count_exceeds_budget",
+                }
+            )
+    for item in result.complex_split:
+        if item.budget_status == "capped":
+            warnings.append(
+                {
+                    "scope": "owner_bone",
+                    "owner_bone": item.bone,
+                    "owner_bone_name": item.bone_name,
+                    "requested_cube_count": item.requested_subpart_count,
+                    "cube_count": len(item.subparts),
+                    "threshold": item.budget_limit,
+                    "budget_multiplier": AUTO_SPATIAL_SPLIT_OWNER_BUDGET_MULTIPLIER,
+                    "reason": item.budget_reason or "auto_spatial_split_capped_to_budget",
                 }
             )
     return warnings

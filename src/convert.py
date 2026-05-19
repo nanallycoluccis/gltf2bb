@@ -31,7 +31,7 @@ from .partition import (
     resolve_bone_node,
 )
 from .conversion.bbmodel import build_bbmodel
-from .conversion.constants import DEFAULT_COMPLEX_SPLIT_BONE, EPSILON, MIN_CUBE_SIZE
+from .conversion.constants import AUTO_SPATIAL_SPLIT_OWNER_BUDGET_MULTIPLIER, DEFAULT_COMPLEX_SPLIT_BONE, EPSILON, MIN_CUBE_SIZE
 from .conversion.geometry import (
     bbox_corners,
     bbox_dimensions,
@@ -1195,18 +1195,22 @@ def apply_generic_complex_split(
         )
         component_accumulator = accumulator_from_faces(component_faces)
         split_parts = []
+        requested_split_parts: list[AutoSpatialPart] = []
+        capped_to_budget = False
+        budget_limit = AUTO_SPATIAL_SPLIT_OWNER_BUDGET_MULTIPLIER
         if (
             should_generic_complex_auto_spatial_split(bone_name)
             and len(component_faces) >= AUTO_SPATIAL_SPLIT_MIN_FACES
             and should_auto_spatial_split(component_accumulator, owner_height, owner_volume)
         ):
-            split_parts = generic_complex_auto_spatial_split_faces(
+            requested_split_parts = generic_complex_auto_spatial_split_faces(
                 part_name,
                 component_faces,
                 component_accumulator,
                 owner_height,
                 generic_complex_auto_spatial_axis_limit(bone_name),
             )
+            split_parts, capped_to_budget = cap_auto_spatial_parts(requested_split_parts, budget_limit)
         if len(split_parts) >= 2:
             for split_part in split_parts:
                 split_part_name = unique_part_name(split_part.name, report_accumulators)
@@ -1543,7 +1547,11 @@ def apply_auto_spatial_split(
         if not should_auto_spatial_split(accumulator, model_height, model_volume):
             continue
 
-        split_parts = auto_spatial_split_faces(part_key.name, faces, accumulator, model_height)
+        requested_split_parts = auto_spatial_split_faces(part_key.name, faces, accumulator, model_height)
+        if len(requested_split_parts) < 2:
+            continue
+        budget_limit = AUTO_SPATIAL_SPLIT_OWNER_BUDGET_MULTIPLIER
+        split_parts, capped_to_budget = cap_auto_spatial_parts(requested_split_parts, budget_limit)
         if len(split_parts) < 2:
             continue
 
@@ -1580,6 +1588,12 @@ def apply_auto_spatial_split(
                     )
                     for name, part_accumulator in sorted(report_accumulators.items())
                 ],
+                original_cube_dimensions=bbox_dimensions(accumulator.min_xyz, accumulator.max_xyz),
+                split_method="auto_spatial_grid",
+                requested_subpart_count=len(requested_split_parts),
+                budget_limit=budget_limit,
+                budget_status="capped" if capped_to_budget else "within_budget",
+                budget_reason="auto_spatial_split_capped_to_budget" if capped_to_budget else None,
             )
         )
     return reports
@@ -1680,6 +1694,29 @@ def split_auto_spatial_parts(
         result.extend(split_parts or [part])
     return result
 
+
+
+def cap_auto_spatial_parts(
+    parts: list[AutoSpatialPart],
+    budget_limit: int,
+) -> tuple[list[AutoSpatialPart], bool]:
+    if budget_limit <= 0 or len(parts) <= budget_limit:
+        return parts, False
+
+    all_faces = [face for part in parts for face in part.faces]
+    if len(all_faces) < 2:
+        return parts[:budget_limit], True
+
+    min_xyz, max_xyz = faces_bbox(all_faces)
+    dimensions = bbox_dimensions(min_xyz, max_xyz)
+    axis = max(range(3), key=lambda index: dimensions[index])
+    base_name = parts[0].name.rsplit("_", 1)[0] if parts else "part"
+    capped = split_auto_spatial_parts(
+        [AutoSpatialPart(f"{base_name}_budget", all_faces, min_xyz, max_xyz)],
+        axis,
+        budget_limit,
+    )
+    return [part for part in capped if part.faces] or parts[:budget_limit], True
 
 def accumulator_from_auto_spatial_part(part: AutoSpatialPart) -> BBoxAccumulator:
     accumulator = BBoxAccumulator(min_xyz=part.min_xyz.copy(), max_xyz=part.max_xyz.copy(), faces=len(part.faces))
