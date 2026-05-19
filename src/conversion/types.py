@@ -165,6 +165,13 @@ class FaceFeatureProtectionAction:
     before_bbox: tuple[list[float], list[float]]
     after_bbox: tuple[list[float], list[float]]
     feature_bbox: tuple[list[float], list[float]]
+    adjusted_part_name: str = ""
+    protected_feature_names: tuple[str, ...] = ()
+    axis: str | None = None
+    target_value: float | None = None
+    margin: float | None = None
+    front_sign: int | None = None
+    overlap_axes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

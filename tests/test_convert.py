@@ -593,6 +593,93 @@ class ConvertModelTest(unittest.TestCase):
             any(action["action"] == "raise_hair_front_above_features" for action in protection_report["actions"])
         )
 
+    def test_explicit_eye_brow_mouth_nose_planes_remain_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "explicit_face_feature_planes.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            write_explicit_face_feature_planes_fixture(model_path, include_front_hair=True)
+
+            convert_model(
+                model_path,
+                output_path,
+                target_height=4.0,
+                complex_split=("head",),
+                report_path=report_path,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        summary = assert_cube_only_bbmodel(self, data)
+        elements = {element["name"]: element for element in data["elements"]}
+        feature_names = ["目.R_cube", "brow.L_cube", "mouth_cube", "nose_cube"]
+        head_core_elements = [element for name, element in elements.items() if name.startswith("head_core")]
+        hair_front_elements = [element for name, element in elements.items() if name.startswith("hair_front")]
+
+        self.assertTrue(head_core_elements)
+        self.assertTrue(hair_front_elements)
+        self.assertTrue(set(feature_names).issubset(summary["element_names"]))
+        for feature_name in feature_names:
+            feature = elements[feature_name]
+            self.assertEqual(feature["from"][2], feature["to"][2])
+            feature_z = feature["from"][2]
+            self.assertTrue(all(element["to"][2] <= feature_z for element in head_core_elements), feature_name)
+
+        feature_max_y = max(elements[name]["to"][1] for name in feature_names)
+        self.assertTrue(all(element["from"][1] >= feature_max_y for element in hair_front_elements))
+
+        actions = report["face_feature_protection"]["actions"]
+        self.assertTrue(any(action["action"] == "clamp_head_core_behind_features" for action in actions))
+        self.assertTrue(any(action["action"] == "raise_hair_front_above_features" for action in actions))
+        for action in actions:
+            self.assertIn(action["adjusted_part_name"], action["cube_name"])
+            self.assertIn(action["axis"], {"z", "y"})
+            self.assertIsNotNone(action["target_value"])
+            self.assertIsNotNone(action["margin"])
+            self.assertIn("nose", action["protected_feature_names"])
+            self.assertIn("mouth", action["protected_feature_names"])
+            self.assertEqual(action["overlap_axes"], ["x", "y"])
+
+    def test_disabled_face_feature_protection_leaves_visibility_overlaps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "explicit_face_feature_planes.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            config_path = Path(temp_dir) / "config.json"
+            write_explicit_face_feature_planes_fixture(model_path, include_front_hair=True)
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "complex_split": {"enabled": True, "bones": ["head"]},
+                        "face_feature_protection": {"enabled": False},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            convert_model(
+                model_path,
+                output_path,
+                target_height=4.0,
+                config_path=config_path,
+                report_path=report_path,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        assert_cube_only_bbmodel(self, data)
+        elements = {element["name"]: element for element in data["elements"]}
+        feature_names = ["目.R_cube", "brow.L_cube", "mouth_cube", "nose_cube"]
+        feature_min_z = min(elements[name]["from"][2] for name in feature_names)
+        feature_max_y = max(elements[name]["to"][1] for name in feature_names)
+        head_core_elements = [element for name, element in elements.items() if name.startswith("head_core")]
+        hair_front_elements = [element for name, element in elements.items() if name.startswith("hair_front")]
+
+        self.assertFalse(report["face_feature_protection"]["enabled"])
+        self.assertEqual(report["face_feature_protection"]["actions"], [])
+        self.assertTrue(any(element["to"][2] > feature_min_z for element in head_core_elements))
+        self.assertTrue(any(element["from"][1] < feature_max_y for element in hair_front_elements))
+
     def test_face_feature_protection_can_disable_front_hair_adjustment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = Path(temp_dir) / "explicit_eye_front_hair.gltf"
@@ -2016,6 +2103,89 @@ def write_explicit_eye_head_fixture(
             *([{"name": "back hair"}] if include_back_hair else []),
         ],
         "meshes": [{"name": "explicit_eye_head", "primitives": primitives}],
+        "accessors": accessors,
+        "bufferViews": buffer_views,
+        "buffers": [{"byteLength": len(payload_bytes), "uri": f"data:application/octet-stream;base64,{payload}"}],
+    }
+    path.write_text(json.dumps(model), encoding="utf-8")
+
+
+def write_explicit_face_feature_planes_fixture(path: Path, include_front_hair: bool = False) -> None:
+    def repeated_triangle(points: list[tuple[float, float, float]], count: int) -> list[tuple[float, float, float]]:
+        result: list[tuple[float, float, float]] = []
+        for _ in range(count):
+            result.extend(points)
+        return result
+
+    chunks: list[bytes] = []
+    buffer_views: list[dict[str, int]] = []
+    accessors: list[dict[str, int | str]] = []
+    primitives: list[dict[str, object]] = []
+    byte_offset = 0
+
+    def append_chunk(data: bytes) -> int:
+        nonlocal byte_offset
+        view_index = len(buffer_views)
+        buffer_views.append({"buffer": 0, "byteOffset": byte_offset, "byteLength": len(data)})
+        chunks.append(data)
+        byte_offset += len(data)
+        return view_index
+
+    def add_primitive(points: list[tuple[float, float, float]], joint: int, material: int) -> None:
+        positions = b"".join(struct.pack("<fff", *point) for point in points)
+        joints = bytes([joint, 0, 0, 0] * len(points))
+        weights = b"".join(struct.pack("<ffff", 1.0, 0.0, 0.0, 0.0) for _ in points)
+        position_accessor = len(accessors)
+        accessors.append({"bufferView": append_chunk(positions), "componentType": 5126, "count": len(points), "type": "VEC3"})
+        joints_accessor = len(accessors)
+        accessors.append({"bufferView": append_chunk(joints), "componentType": 5121, "count": len(points), "type": "VEC4"})
+        weights_accessor = len(accessors)
+        accessors.append({"bufferView": append_chunk(weights), "componentType": 5126, "count": len(points), "type": "VEC4"})
+        primitives.append(
+            {
+                "attributes": {"POSITION": position_accessor, "JOINTS_0": joints_accessor, "WEIGHTS_0": weights_accessor},
+                "material": material,
+                "mode": 4,
+            }
+        )
+
+    add_primitive(repeated_triangle([(-1.1, 1.0, -1.0), (1.1, 1.0, -1.0), (0.0, 2.2, -1.0)], 80), 1, 0)
+    add_primitive(repeated_triangle([(-1.2, 0.9, 1.35), (1.2, 0.9, 1.35), (0.0, 2.25, 1.35)], 80), 1, 0)
+    add_primitive([(-0.55, 1.55, 1.2), (-0.3, 1.55, 1.2), (-0.425, 1.68, 1.2)], 2, 1)
+    add_primitive([(-0.55, 1.82, 1.2), (-0.25, 1.82, 1.2), (-0.4, 1.92, 1.2)], 3, 2)
+    add_primitive([(-0.18, 1.28, 1.2), (0.18, 1.28, 1.2), (0.0, 1.36, 1.2)], 4, 3)
+    add_primitive([(-0.08, 1.45, 1.2), (0.08, 1.45, 1.2), (0.0, 1.58, 1.2)], 5, 4)
+    if include_front_hair:
+        add_primitive(repeated_triangle([(-1.25, 1.15, 1.45), (1.25, 1.15, 1.45), (0.0, 2.4, 1.45)], 120), 1, 5)
+
+    payload_bytes = b"".join(chunks)
+    payload = base64.b64encode(payload_bytes).decode("ascii")
+    materials = [
+        {"name": "face_skin"},
+        {"name": "eye material"},
+        {"name": "eyebrow material"},
+        {"name": "mouth material"},
+        {"name": "nose material"},
+    ]
+    if include_front_hair:
+        materials.append({"name": "front hair"})
+
+    model = {
+        "asset": {"version": "2.0", "generator": "gltf2bb explicit face feature visibility test"},
+        "scene": 0,
+        "scenes": [{"nodes": [6]}],
+        "nodes": [
+            {"name": "root_joint", "children": [1]},
+            {"name": "head", "translation": [0.0, 1.0, 0.0], "children": [2, 3, 4, 5]},
+            {"name": "目.R"},
+            {"name": "brow.L"},
+            {"name": "mouth"},
+            {"name": "nose"},
+            {"name": "mesh_node", "mesh": 0, "skin": 0},
+        ],
+        "skins": [{"joints": [0, 1, 2, 3, 4, 5]}],
+        "materials": materials,
+        "meshes": [{"name": "explicit_face_feature_planes", "primitives": primitives}],
         "accessors": accessors,
         "bufferViews": buffer_views,
         "buffers": [{"byteLength": len(payload_bytes), "uri": f"data:application/octet-stream;base64,{payload}"}],

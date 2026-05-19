@@ -123,11 +123,18 @@ def face_feature_protection_action_to_dict(item: FaceFeatureProtectionAction) ->
     return {
         "owner_bone": item.owner_bone,
         "owner_bone_name": item.owner_bone_name,
+        "adjusted_part_name": item.adjusted_part_name,
         "cube_name": item.cube_name,
         "action": item.action,
         "before_bbox": bbox_to_dict(item.before_bbox),
         "after_bbox": bbox_to_dict(item.after_bbox),
         "feature_bbox": bbox_to_dict(item.feature_bbox),
+        "protected_feature_names": list(item.protected_feature_names),
+        "axis": item.axis,
+        "target_value": rounded_number_or_error(item.target_value) if item.target_value is not None else None,
+        "margin": rounded_number_or_error(item.margin) if item.margin is not None else None,
+        "front_sign": item.front_sign,
+        "overlap_axes": list(item.overlap_axes),
     }
 
 
