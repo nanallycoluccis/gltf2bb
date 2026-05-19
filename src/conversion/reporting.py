@@ -407,7 +407,7 @@ def cube_budget_warnings_to_dict(result: ConvertResult) -> list[dict[str, Any]]:
                 }
             )
     for item in result.complex_split:
-        if item.budget_status == "capped":
+        if item.budget_status in {"capped", "over_budget_warning"}:
             warnings.append(
                 {
                     "scope": "owner_bone",
@@ -417,7 +417,7 @@ def cube_budget_warnings_to_dict(result: ConvertResult) -> list[dict[str, Any]]:
                     "cube_count": len(item.subparts),
                     "threshold": item.budget_limit,
                     "budget_multiplier": AUTO_SPATIAL_SPLIT_OWNER_BUDGET_MULTIPLIER,
-                    "reason": item.budget_reason or "auto_spatial_split_capped_to_budget",
+                    "reason": item.budget_reason or "split_exceeds_owner_budget",
                 }
             )
     return warnings

@@ -978,6 +978,116 @@ class ConvertModelTest(unittest.TestCase):
         self.assertTrue(report["hybrid_detail_split"]["by_material"])
         self.assertTrue(report["hybrid_detail_split"]["by_connected_component"])
 
+    def test_hybrid_mode_preserves_compact_material_details_as_editable_cubes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "compact_material_detail.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            config_path = Path(temp_dir) / "config.json"
+            write_compact_material_detail_fixture(model_path)
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "hybrid_detail_split": {
+                            "min_faces": 20,
+                            "min_material_faces": 6,
+                            "min_component_faces": 4,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = convert_model(
+                model_path,
+                output_path,
+                mode="hybrid",
+                target_height=10.0,
+                config_path=config_path,
+                report_path=report_path,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        summary = assert_cube_only_bbmodel(self, data)
+        self.assertEqual(len(result.cubes), 4)
+        self.assertEqual(
+            set(summary["element_names"]),
+            {
+                "body_cube",
+                "compact_detail_button_cube",
+                "compact_detail_lace_cube",
+                "compact_detail_trim_cube",
+            },
+        )
+        detail_split = next(item for item in report["complex_split"] if item["bone_name"] == "compact_detail")
+        self.assertEqual(
+            {subpart["name"] for subpart in detail_split["subparts"]},
+            {"compact_detail_button", "compact_detail_lace", "compact_detail_trim"},
+        )
+        self.assertEqual({subpart["method"] for subpart in detail_split["subparts"]}, {"regular_material_component"})
+        self.assertEqual(detail_split["budget_status"], "over_budget_warning")
+        self.assertEqual(detail_split["budget_limit"], 2)
+        warning = next(
+            item
+            for item in report["quality"]["cube_budget_warnings"]
+            if item.get("owner_bone_name") == "compact_detail"
+        )
+        self.assertEqual(warning["reason"], "regular_detail_split_exceeds_owner_budget")
+
+    def test_cleanup_deletes_tiny_material_noise_without_losing_compact_details(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "compact_material_detail_noise.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            config_path = Path(temp_dir) / "config.json"
+            write_compact_material_detail_fixture(model_path, include_noise=True)
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "hybrid_detail_split": {
+                            "min_faces": 20,
+                            "min_material_faces": 6,
+                            "min_component_faces": 4,
+                        },
+                        "cleanup": {"delete_small_parts": True, "min_faces": 20},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = convert_model(
+                model_path,
+                output_path,
+                mode="hybrid",
+                target_height=10.0,
+                config_path=config_path,
+                report_path=report_path,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        summary = assert_cube_only_bbmodel(self, data)
+        self.assertEqual(len(result.cubes), 4)
+        self.assertEqual(
+            set(summary["element_names"]),
+            {
+                "body_cube",
+                "compact_detail_button_cube",
+                "compact_detail_lace_cube",
+                "compact_detail_trim_cube",
+            },
+        )
+        self.assertNotIn("compact_detail_misc_cube", summary["element_names"])
+        deleted = report["cleanup"]["deleted_parts"]
+        self.assertEqual(len(deleted), 1)
+        self.assertEqual(deleted[0]["name"], "compact_detail_misc")
+        self.assertEqual(deleted[0]["reason"], "faces<20")
+        self.assertEqual(deleted[0]["faces"], 1)
+        detail_split = next(item for item in report["complex_split"] if item["bone_name"] == "compact_detail")
+        self.assertIn("regular_material_component", {subpart["method"] for subpart in detail_split["subparts"]})
+        self.assertEqual(report["totals"]["deleted_small_parts"], 1)
+
     def test_hybrid_detail_split_config_can_disable_regular_detail_split(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = Path(temp_dir) / "material_detail_foot.gltf"
@@ -2692,6 +2802,79 @@ def write_material_detail_foot_fixture(path: Path) -> None:
         "skins": [{"joints": [0, 1]}],
         "materials": [{"name": "body"}, {"name": "skin"}, {"name": "shoe"}, {"name": "heel"}],
         "meshes": [{"name": "material_detail_foot", "primitives": primitives}],
+        "accessors": accessors,
+        "bufferViews": buffer_views,
+        "buffers": [{"byteLength": len(payload_bytes), "uri": f"data:application/octet-stream;base64,{payload}"}],
+    }
+    path.write_text(json.dumps(model), encoding="utf-8")
+
+
+def write_compact_material_detail_fixture(path: Path, include_noise: bool = False) -> None:
+    chunks: list[bytes] = []
+    buffer_views: list[dict[str, int]] = []
+    accessors: list[dict[str, int | str]] = []
+    primitives: list[dict[str, object]] = []
+    byte_offset = 0
+
+    def append_chunk(data: bytes) -> int:
+        nonlocal byte_offset
+        view_index = len(buffer_views)
+        buffer_views.append({"buffer": 0, "byteOffset": byte_offset, "byteLength": len(data)})
+        chunks.append(data)
+        byte_offset += len(data)
+        return view_index
+
+    def repeated_triangle(points: list[tuple[float, float, float]], count: int) -> list[tuple[float, float, float]]:
+        result: list[tuple[float, float, float]] = []
+        for _ in range(count):
+            result.extend(points)
+        return result
+
+    def add_primitive(points: list[tuple[float, float, float]], joint: int, material: int) -> None:
+        positions = b"".join(struct.pack("<fff", *point) for point in points)
+        joints = bytes([joint, 0, 0, 0] * len(points))
+        weights = b"".join(struct.pack("<ffff", 1.0, 0.0, 0.0, 0.0) for _ in points)
+        position_accessor = len(accessors)
+        accessors.append({"bufferView": append_chunk(positions), "componentType": 5126, "count": len(points), "type": "VEC3"})
+        joints_accessor = len(accessors)
+        accessors.append({"bufferView": append_chunk(joints), "componentType": 5121, "count": len(points), "type": "VEC4"})
+        weights_accessor = len(accessors)
+        accessors.append({"bufferView": append_chunk(weights), "componentType": 5126, "count": len(points), "type": "VEC4"})
+        primitives.append(
+            {
+                "attributes": {"POSITION": position_accessor, "JOINTS_0": joints_accessor, "WEIGHTS_0": weights_accessor},
+                "material": material,
+                "mode": 4,
+            }
+        )
+
+    add_primitive(repeated_triangle([(-0.2, 0.0, 0.0), (0.2, 0.0, 0.0), (0.0, 10.0, 0.0)], 20), 0, 0)
+    add_primitive(repeated_triangle([(-0.45, 8.7, -0.25), (-0.05, 8.7, -0.25), (-0.25, 9.15, -0.25)], 12), 1, 1)
+    add_primitive(repeated_triangle([(0.05, 8.7, 0.25), (0.45, 8.7, 0.25), (0.25, 9.15, 0.25)], 12), 1, 2)
+    add_primitive(repeated_triangle([(-0.2, 8.35, 0.0), (0.2, 8.35, 0.0), (0.0, 8.65, 0.0)], 12), 1, 3)
+    if include_noise:
+        add_primitive([(0.62, 8.2, 0.62), (0.66, 8.2, 0.62), (0.62, 8.26, 0.62)], 1, 4)
+
+    payload_bytes = b"".join(chunks)
+    payload = base64.b64encode(payload_bytes).decode("ascii")
+    model = {
+        "asset": {"version": "2.0", "generator": "gltf2bb compact material detail split test"},
+        "scene": 0,
+        "scenes": [{"nodes": [2]}],
+        "nodes": [
+            {"name": "body", "children": [1]},
+            {"name": "compact_detail"},
+            {"name": "mesh_node", "mesh": 0, "skin": 0},
+        ],
+        "skins": [{"joints": [0, 1]}],
+        "materials": [
+            {"name": "body"},
+            {"name": "lace"},
+            {"name": "button"},
+            {"name": "trim"},
+            {"name": "noise"},
+        ],
+        "meshes": [{"name": "compact_material_detail", "primitives": primitives}],
         "accessors": accessors,
         "bufferViews": buffer_views,
         "buffers": [{"byteLength": len(payload_bytes), "uri": f"data:application/octet-stream;base64,{payload}"}],

@@ -339,8 +339,16 @@ def convert_model(
         bones,
         vrm_humanoid_nodes,
     )
+    cleanup_protected_part_keys: set[PartKey] = set()
     complex_split_report.extend(
-        apply_regular_detail_split(accumulators, regular_faces_by_part, bones, mode, config.hybrid_detail_split)
+        apply_regular_detail_split(
+            accumulators,
+            regular_faces_by_part,
+            bones,
+            mode,
+            config.hybrid_detail_split,
+            cleanup_protected_part_keys,
+        )
     )
     face_feature_protection_actions.extend(
         apply_explicit_face_feature_visibility_protection(
@@ -350,7 +358,14 @@ def convert_model(
         )
     )
     complex_split_report.extend(apply_auto_spatial_split(accumulators, regular_faces_by_part, bones, mode))
-    cleanup_report = apply_cleanup(accumulators, bones, config.cleanup, warnings, regular_faces_by_part)
+    cleanup_report = apply_cleanup(
+        accumulators,
+        bones,
+        config.cleanup,
+        warnings,
+        regular_faces_by_part,
+        cleanup_protected_part_keys,
+    )
     populated = {
         part_key: accumulator
         for part_key, accumulator in accumulators.items()
@@ -1272,6 +1287,7 @@ def apply_regular_detail_split(
     bones: dict[int, BonePartition],
     mode: str,
     detail_split: HybridDetailSplitConfig,
+    cleanup_protected_part_keys: set[PartKey] | None = None,
 ) -> list[ComplexSplitBoneReport]:
     if mode != "hybrid" or not detail_split.enabled:
         return []
@@ -1313,6 +1329,8 @@ def apply_regular_detail_split(
             new_key = PartKey(part_key.owner_bone, part_name)
             accumulators[new_key] = part_accumulator
             regular_faces_by_part[new_key] = part_faces
+            if cleanup_protected_part_keys is not None and is_significant_regular_detail_method(method, part_name):
+                cleanup_protected_part_keys.add(new_key)
             used_names[part_name] = part_accumulator
             subparts.append(
                 ComplexSplitSubpartReport(
@@ -1326,15 +1344,29 @@ def apply_regular_detail_split(
         if not subparts:
             continue
         bone = bones.get(part_key.owner_bone)
+        budget_limit = AUTO_SPATIAL_SPLIT_OWNER_BUDGET_MULTIPLIER
+        budget_status = "within_budget" if len(split_specs) <= budget_limit else "over_budget_warning"
         reports.append(
             ComplexSplitBoneReport(
                 bone=part_key.owner_bone,
                 bone_name=bone.name if bone is not None else part_key.name,
                 source_faces=accumulator.faces,
                 subparts=sorted(subparts, key=lambda item: item.name),
+                original_cube_dimensions=bbox_dimensions(accumulator.min_xyz, accumulator.max_xyz),
+                split_method="regular_detail_split",
+                requested_subpart_count=len(split_specs),
+                budget_limit=budget_limit,
+                budget_status=budget_status,
+                budget_reason="regular_detail_split_exceeds_owner_budget" if budget_status == "over_budget_warning" else None,
             )
         )
     return reports
+
+
+def is_significant_regular_detail_method(method: str, part_name: str) -> bool:
+    if part_name.endswith("_misc"):
+        return False
+    return method in {"regular_material_component", "regular_connected_component", "regular_spatial_detail"}
 
 
 def should_regular_detail_split_accumulator(
@@ -2967,6 +2999,7 @@ def apply_cleanup(
     cleanup: CleanupConfig,
     warnings: list[str],
     regular_faces_by_part: dict[PartKey, list[SplitFace]] | None = None,
+    protected_part_keys: set[PartKey] | None = None,
 ) -> CleanupReport:
     report = CleanupReport()
     if not cleanup.delete_small_parts and not cleanup.merge_small_parts_to_parent:
@@ -2975,7 +3008,8 @@ def apply_cleanup(
         warnings.append("Cleanup was enabled but no small-part thresholds were set; skipped cleanup.")
         return report
 
-    apply_regular_connected_component_cleanup(accumulators, bones, cleanup, regular_faces_by_part or {}, report)
+    protected_part_keys = protected_part_keys or set()
+    apply_regular_connected_component_cleanup(accumulators, bones, cleanup, regular_faces_by_part or {}, report, protected_part_keys)
 
     for part_key, accumulator in sorted(list(accumulators.items()), key=lambda item: (item[0].owner_bone, item[0].name)):
         if accumulators.get(part_key) is not accumulator:
@@ -2985,6 +3019,8 @@ def apply_cleanup(
 
         reason = small_part_reason(accumulator, cleanup)
         if reason is None:
+            continue
+        if part_key in protected_part_keys:
             continue
 
         if cleanup.merge_small_parts_to_parent:
@@ -3014,10 +3050,14 @@ def apply_regular_connected_component_cleanup(
     cleanup: CleanupConfig,
     regular_faces_by_part: dict[PartKey, list[SplitFace]],
     report: CleanupReport,
+    protected_part_keys: set[PartKey] | None = None,
 ) -> None:
     pending_merges: list[tuple[int, BBoxAccumulator]] = []
+    protected_part_keys = protected_part_keys or set()
     for part_key, faces in sorted(regular_faces_by_part.items(), key=lambda item: (item[0].owner_bone, item[0].name)):
         if part_key not in accumulators or len(faces) < 2:
+            continue
+        if part_key in protected_part_keys:
             continue
 
         component_indices = connected_cleanup_face_components(faces)
