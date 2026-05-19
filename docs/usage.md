@@ -1,6 +1,6 @@
 # gltf2bb Usage Guide
 
-`gltf2bb` converts glTF, GLB, or VRM models with skeletons and skin weights into Blockbench-friendly `.bbmodel` project files. The project is still an MVP: it prioritizes reading input models, assigning faces to bones, generating editable cube hierarchies, and preserving usable pivots. It does not try to fully reconstruct the original appearance, textures, UVs, or animations.
+`gltf2bb` converts glTF, GLB, or VRM models with skeletons and skin weights into Blockbench-friendly `.bbmodel` project files. The project is still an MVP: it prioritizes reading input models, assigning faces to bones, generating editable cube hierarchies, and preserving usable pivots. Output is cube-only: the writer emits Blockbench free-model cube elements, groups, and outliner data. It does not emit arbitrary `.bbmodel` mesh elements, UV maps, texture assets, materials, or animation data.
 
 ## Requirements
 
@@ -45,7 +45,7 @@ If `-o` / `--output` is omitted, `convert` writes to `out/<input-stem>.bbmodel`.
 3. Start with `convert --mode cuboid` for the most conservative one-bbox-cube-per-bone output.
 4. For character models, try `--preset mmd_humanoid` or `--preset humanoid`.
 5. For hair, skirts, coats, accessories, or other complex parts, try `--mode hybrid` or `--complex-split`.
-6. Open the `.bbmodel` in Blockbench and manually refine proportions, cube shapes, joints, and animations.
+6. Open the `.bbmodel` in Blockbench and manually refine proportions, cube shapes, joints, and any animations you choose to create there.
 
 ## Commands
 
@@ -89,7 +89,7 @@ Important report fields:
 
 ### convert
 
-Generates a Blockbench `.bbmodel` file. Current output consists of cubes, groups, and outliner hierarchy. Textures, UVs, animations, and `.bbmodel` mesh elements are not exported.
+Generates a Blockbench `.bbmodel` file. Current output consists of cube elements, groups, and outliner hierarchy in Blockbench free-model format. Arbitrary mesh element output, UV export, texture export, material export, and animation export are out of scope for the current implementation and are not emitted.
 
 ```bash
 uv run gltf2bb convert path/to/model.glb -o out/model.bbmodel
@@ -138,7 +138,7 @@ Limitations:
 
 ### hybrid
 
-`hybrid` does not currently emit mesh elements. Instead, it automatically enables special cube splitting for complex bones such as `head`, `hair`, `skirt`, `coat`, and `accessory`. Other bones keep the normal bbox cube behavior.
+`hybrid` does not emit mesh elements. It remains cube-only and automatically enables special cube splitting for complex bones such as `head`, `hair`, `skirt`, `coat`, and `accessory`. Other bones keep the normal bbox cube behavior.
 
 ```bash
 uv run gltf2bb convert character.glb --mode hybrid --preset mmd_humanoid --report out/hybrid-report.json
@@ -260,7 +260,26 @@ Supported `scope` values:
 - `bone_cubes`: Affects normal bone cubes.
 - `matching_bones`: Affects cubes whose owner bone name matches the configured names.
 
-This feature is experimental and disabled by default. Results are recorded under `oriented_cubes` and `totals.oriented_cubes` in the convert report.
+This feature is experimental and disabled by default. Results are recorded under `oriented_cubes`, `orientation_decisions`, and `totals.oriented_cubes` in the convert report. Each `oriented_cubes[]` entry includes the cube name, owner bone, rotation, source, reason, original and oriented bbox volume when available, and `cube_only_compatible`. `orientation_decisions[]` records accepted and rejected auto-orientation candidates so rejected rotations can be audited without changing the cube-only output.
+
+### Face Feature Protection
+
+`face_feature_protection` is enabled by default. It adjusts `head_core` and `hair_front` cube bounds around explicit eye, brow, mouth, nose, and similar face-feature parts when those parts are present.
+
+```json
+{
+  "face_feature_protection": {
+    "enabled": true,
+    "min_faces": 32,
+    "margin_ratio": 0.002,
+    "outlier_gap_ratio": 0.05,
+    "protect_hair_front": true,
+    "protect_head_core_front": true
+  }
+}
+```
+
+Report actions are written to `face_feature_protection.actions`. Each action records `adjusted_part_name`, `cube_name`, before and after bbox values, `protected_feature_names`, `axis`, `target_value`, `margin`, `front_sign`, and `overlap_axes`.
 
 ## Output Files
 
@@ -270,8 +289,10 @@ Current `.bbmodel` output includes:
 - Cube elements.
 - Groups corresponding to kept skeleton bones.
 - Group and cube outliner hierarchy.
-- Empty textures.
-- Empty animations.
+- Empty `textures` array.
+- Empty `animations` array.
+
+The empty arrays keep the project shape familiar to Blockbench, but `gltf2bb` does not export source textures, UV maps, materials, arbitrary mesh elements, or animation clips.
 
 Coordinate handling:
 
@@ -303,10 +324,25 @@ Key fields:
 - `scale`: Scale applied to the output model.
 - `totals.cubes`: Number of generated cubes.
 - `totals.empty_bones`: Number of kept bones with no geometry.
-- `complex_split`: Details for complex bone splitting.
+- `complex_split`: Details for complex bone splitting. Its budget fields include `original_cube_dimensions`, `split_method`, `requested_subpart_count`, `budget_limit`, `budget_status`, and `budget_reason`.
 - `cleanup`: Small part deletion, merge, and keep records.
-- `oriented_cubes`: Cubes that received rotation.
+- `oriented_cubes`: Cubes that received rotation, including `reason`, `original_bbox_volume`, `oriented_bbox_volume`, and `cube_only_compatible`.
+- `orientation_decisions`: Accepted and rejected auto-orientation candidates.
+- `face_feature_protection.actions`: Face-feature protection adjustments with adjusted part name, protected feature names, axis, target value, margin, front sign, and overlap axes.
+- `quality`: Cube-only output diagnostics.
 - `warnings`: Conversion diagnostics.
+
+Important `quality` fields:
+
+- `quality.cube_only`: Confirms this report came from a cube-only `.bbmodel` export. It includes cube count and zero mesh/vertex element counts.
+- `quality.cube_count_by_owner_bone`: Cube counts grouped by resolved owner bone.
+- `quality.largest_cubes`: Largest cube candidates by volume for quick inspection.
+- `quality.oversized_cubes`: Largest-by-volume cubes flagged as oversized candidates.
+- `quality.unrotated_elongated_cubes`: Long cubes that did not receive rotation, with a reason.
+- `quality.tiny_fragment_cubes`: Small low-face cube candidates that may be cleanup noise.
+- `quality.skipped_unskinned_meshes_summary`: Count, node indices, mesh indices, and reasons for skipped unskinned meshes.
+- `quality.split_diagnostics`: Per-complex-bone split methods, output cube count, tiny component handling, and budget fields.
+- `quality.cube_budget_warnings`: Model-level, owner-bone-level, and split budget warnings such as `cube_count_exceeds_budget`, `owner_cube_count_exceeds_budget`, `auto_spatial_split_capped_to_budget`, and `regular_detail_split_exceeds_owner_budget`.
 
 ## Input Model Recommendations
 
@@ -380,6 +416,14 @@ Run the test suite:
 ```bash
 uv run python -m unittest discover -s tests
 ```
+
+Run the exp-model quality benchmark helper when the ignored `exp/` models are available:
+
+```bash
+uv run python tests/quality_benchmark.py --evidence .omo/evidence/quality-benchmark-summary.json
+```
+
+The helper converts the selected exp models in `hybrid` mode and writes raw `.bbmodel` plus raw report JSON files to `/tmp/gltf2bb-quality/`. Keep those raw files out of the repo. The evidence file is a compact summary with command status, cube count, report quality keys, totals keys, and budget warnings for each model.
 
 Run a minimal fixture through the full pipeline:
 
