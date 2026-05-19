@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -230,7 +231,13 @@ def oriented_cube_to_dict(item: OrientedCubeReport) -> dict[str, Any]:
 
 def quality_to_dict(result: ConvertResult) -> dict[str, Any]:
     return {
+        "cube_only": cube_only_quality_to_dict(result),
+        "cube_count_by_owner_bone": cube_count_by_owner_bone_to_dict(result.cubes),
         "largest_cubes": [quality_cube_to_dict(cuboid) for cuboid in largest_quality_cubes(result.cubes)],
+        "oversized_cubes": [
+            quality_oversized_cube_to_dict(cuboid)
+            for cuboid in largest_quality_cubes(result.cubes)
+        ],
         "unrotated_elongated_cubes": [
             quality_unrotated_elongated_cube_to_dict(cuboid, reason)
             for cuboid, reason in unrotated_elongated_quality_cubes(result.cubes)
@@ -242,7 +249,28 @@ def quality_to_dict(result: ConvertResult) -> dict[str, Any]:
         "skipped_unskinned_meshes_summary": skipped_unskinned_meshes_summary_to_dict(
             result.skipped_unskinned_meshes
         ),
+        "split_diagnostics": split_diagnostics_to_dict(result),
+        "cube_budget_warnings": cube_budget_warnings_to_dict(result),
     }
+
+
+def cube_only_quality_to_dict(result: ConvertResult) -> dict[str, Any]:
+    return {
+        "cube_only": True,
+        "cube_count": len(result.cubes),
+        "mesh_element_count": 0,
+        "mesh_element_names": [],
+        "vertex_element_count": 0,
+        "vertex_element_names": [],
+    }
+
+
+def cube_count_by_owner_bone_to_dict(cuboids: list[Cuboid]) -> list[dict[str, Any]]:
+    counts: Counter[tuple[int, str]] = Counter((cuboid.owner_bone, cuboid.owner_bone_name) for cuboid in cuboids)
+    return [
+        {"owner_bone": owner_bone, "owner_bone_name": owner_bone_name, "cubes": count}
+        for (owner_bone, owner_bone_name), count in sorted(counts.items(), key=lambda item: (item[0][1], item[0][0]))
+    ]
 
 
 def largest_quality_cubes(cuboids: list[Cuboid]) -> list[Cuboid]:
@@ -287,6 +315,57 @@ def quality_cube_to_dict(cuboid: Cuboid) -> dict[str, Any]:
         "faces": cuboid.faces,
         "rotation_source": cuboid.rotation_source,
     }
+
+
+def quality_oversized_cube_to_dict(cuboid: Cuboid) -> dict[str, Any]:
+    data = quality_cube_to_dict(cuboid)
+    data["reason"] = "largest_by_volume"
+    return data
+
+
+def split_diagnostics_to_dict(result: ConvertResult) -> list[dict[str, Any]]:
+    cube_counts = Counter(cuboid.owner_bone for cuboid in result.cubes)
+    return [
+        {
+            "bone": item.bone,
+            "bone_name": item.bone_name,
+            "source_faces": item.source_faces,
+            "subpart_count": len(item.subparts),
+            "output_cubes": cube_counts[item.bone],
+            "methods": sorted({subpart.method for subpart in item.subparts}),
+            "merged_tiny_components": item.merged_tiny_components,
+            "deleted_tiny_components": item.deleted_tiny_components,
+            "merged_tiny_hair_buckets": item.merged_tiny_hair_buckets,
+            "expanded_hair_bucket_overlap": item.expanded_hair_bucket_overlap,
+        }
+        for item in result.complex_split
+    ]
+
+
+def cube_budget_warnings_to_dict(result: ConvertResult) -> list[dict[str, Any]]:
+    warnings: list[dict[str, Any]] = []
+    if len(result.cubes) > result.cube_budget_warning_threshold:
+        warnings.append(
+            {
+                "scope": "model",
+                "cube_count": len(result.cubes),
+                "threshold": result.cube_budget_warning_threshold,
+                "reason": "cube_count_exceeds_budget",
+            }
+        )
+    for item in cube_count_by_owner_bone_to_dict(result.cubes):
+        if item["cubes"] > result.cube_owner_budget_warning_threshold:
+            warnings.append(
+                {
+                    "scope": "owner_bone",
+                    "owner_bone": item["owner_bone"],
+                    "owner_bone_name": item["owner_bone_name"],
+                    "cube_count": item["cubes"],
+                    "threshold": result.cube_owner_budget_warning_threshold,
+                    "reason": "owner_cube_count_exceeds_budget",
+                }
+            )
+    return warnings
 
 
 def quality_unrotated_elongated_cube_to_dict(cuboid: Cuboid, reason: str) -> dict[str, Any]:

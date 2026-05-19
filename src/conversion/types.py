@@ -201,3 +201,5 @@ class ConvertResult:
     assigned_unskinned_meshes: list[AssignedUnskinnedMesh]
     skipped_unskinned_meshes: list[SkippedUnskinnedMesh]
     warnings: list[str]
+    cube_budget_warning_threshold: int = 64
+    cube_owner_budget_warning_threshold: int = 16

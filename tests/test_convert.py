@@ -13,6 +13,104 @@ from src.conversion.types import BBoxAccumulator, PartKey, SplitFace
 from src.inspect import main
 
 
+CUBE_FACE_KEYS = ["down", "east", "north", "south", "up", "west"]
+
+
+def assert_cube_only_bbmodel(testcase: unittest.TestCase, data: dict[str, object]) -> dict[str, object]:
+    summary = summarize_bbmodel(data)
+    testcase.assertGreater(summary["element_count"], 0)
+    testcase.assertEqual(summary["element_types"], ["cube"])
+    testcase.assertEqual(summary["mesh_element_names"], [])
+    testcase.assertEqual(summary["vertex_element_names"], [])
+    testcase.assertTrue(all(face_keys == CUBE_FACE_KEYS for face_keys in summary["face_keys_by_element"].values()))
+    return summary
+
+
+def summarize_bbmodel(data: dict[str, object]) -> dict[str, object]:
+    elements = data.get("elements", [])
+    groups = data.get("groups", [])
+    if not isinstance(elements, list) or not isinstance(groups, list):
+        raise AssertionError("bbmodel must contain list elements and groups")
+
+    element_names: list[str] = []
+    element_types: set[str] = set()
+    mesh_element_names: list[str] = []
+    vertex_element_names: list[str] = []
+    bounds_by_element: dict[str, dict[str, list[float]]] = {}
+    rotations_by_element: dict[str, list[float]] = {}
+    face_keys_by_element: dict[str, list[str]] = {}
+    element_names_by_uuid: dict[str, str] = {}
+
+    for element in elements:
+        if not isinstance(element, dict):
+            raise AssertionError("bbmodel elements must be objects")
+        name = str(element.get("name", ""))
+        element_names.append(name)
+        element_type = str(element.get("type", ""))
+        element_types.add(element_type)
+        if element_type != "cube":
+            mesh_element_names.append(name)
+        if "vertices" in element:
+            vertex_element_names.append(name)
+        bounds_by_element[name] = {
+            "from": rounded_json_vec(element.get("from")),
+            "to": rounded_json_vec(element.get("to")),
+        }
+        if "rotation" in element:
+            rotations_by_element[name] = rounded_json_vec(element.get("rotation"))
+        faces = element.get("faces", {})
+        if not isinstance(faces, dict):
+            raise AssertionError(f"{name} faces must be an object")
+        face_keys_by_element[name] = sorted(str(key) for key in faces)
+        uuid = element.get("uuid")
+        if isinstance(uuid, str):
+            element_names_by_uuid[uuid] = name
+
+    group_names = sorted(str(group.get("name", "")) for group in groups if isinstance(group, dict))
+    outliner_by_group = summarize_outliner_placement(data.get("outliner", []), groups, element_names_by_uuid)
+    return {
+        "element_count": len(elements),
+        "element_names": sorted(element_names),
+        "element_types": sorted(element_types),
+        "group_names": group_names,
+        "outliner_by_group": outliner_by_group,
+        "bounds_by_element": bounds_by_element,
+        "rotations_by_element": rotations_by_element,
+        "face_keys_by_element": face_keys_by_element,
+        "mesh_element_names": sorted(mesh_element_names),
+        "vertex_element_names": sorted(vertex_element_names),
+    }
+
+
+def summarize_outliner_placement(
+    outliner: object,
+    groups: list[object],
+    element_names_by_uuid: dict[str, str],
+) -> dict[str, list[str]]:
+    placement: dict[str, list[str]] = {}
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        uuid = group.get("uuid")
+        name = group.get("name")
+        if not isinstance(uuid, str) or not isinstance(name, str):
+            continue
+        entry = find_outliner_entry(outliner if isinstance(outliner, list) else [], uuid)
+        child_names: list[str] = []
+        if entry is not None:
+            for child in entry.get("children", []):
+                if isinstance(child, str) and child in element_names_by_uuid:
+                    child_names.append(element_names_by_uuid[child])
+        placement[name] = sorted(child_names)
+    return placement
+
+
+def rounded_json_vec(value: object) -> list[float]:
+    if not isinstance(value, list) or len(value) != 3:
+        raise AssertionError("expected numeric 3-vector")
+    return [round(float(item), 6) for item in value]
+
+
 class ConvertModelTest(unittest.TestCase):
     def test_writes_one_bbox_cube_per_assigned_bone(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -23,9 +121,15 @@ class ConvertModelTest(unittest.TestCase):
             result = convert_model(model_path, output_path, target_height=4.0)
             data = json.loads(output_path.read_text(encoding="utf-8"))
 
+        summary = assert_cube_only_bbmodel(self, data)
         self.assertEqual(len(result.cubes), 2)
         self.assertEqual(data["meta"]["model_format"], "free")
         self.assertEqual(data["resolution"], {"width": 16, "height": 16})
+        self.assertEqual(summary["element_count"], 2)
+        self.assertEqual(summary["element_names"], ["child_joint_cube", "root_joint_cube"])
+        self.assertEqual(summary["group_names"], ["child_joint", "root_joint"])
+        self.assertEqual(summary["outliner_by_group"]["root_joint"], ["root_joint_cube"])
+        self.assertEqual(summary["outliner_by_group"]["child_joint"], ["child_joint_cube"])
 
         elements = {element["name"]: element for element in data["elements"]}
         self.assertEqual(set(elements), {"root_joint_cube", "child_joint_cube"})
@@ -37,6 +141,27 @@ class ConvertModelTest(unittest.TestCase):
         groups = {group["name"]: group for group in data["groups"]}
         self.assertEqual(groups["root_joint"]["origin"], [0.0, 0.0, 0.0])
         self.assertEqual(groups["child_joint"]["origin"], [0.0, 2.0, 0.0])
+
+    def test_cube_only_helper_rejects_mesh_only_elements(self) -> None:
+        mesh_only = {
+            "elements": [
+                {
+                    "name": "mesh_part",
+                    "type": "mesh",
+                    "from": [0, 0, 0],
+                    "to": [1, 1, 1],
+                    "origin": [0, 0, 0],
+                    "faces": {},
+                    "vertices": {"0": [0, 0, 0]},
+                    "uuid": "mesh-uuid",
+                }
+            ],
+            "groups": [],
+            "outliner": [],
+        }
+
+        with self.assertRaises(AssertionError):
+            assert_cube_only_bbmodel(self, mesh_only)
 
     def test_cli_convert_command_writes_bbmodel(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -176,6 +301,18 @@ class ConvertModelTest(unittest.TestCase):
             report = json.loads(report_path.read_text(encoding="utf-8"))
 
         quality = report["quality"]
+        self.assertEqual(
+            quality["cube_only"],
+            {
+                "cube_only": True,
+                "cube_count": 1,
+                "mesh_element_count": 0,
+                "mesh_element_names": [],
+                "vertex_element_count": 0,
+                "vertex_element_names": [],
+            },
+        )
+        self.assertEqual(quality["cube_count_by_owner_bone"], [{"owner_bone": 0, "owner_bone_name": "root_joint", "cubes": 1}])
         self.assertEqual(quality["skipped_unskinned_meshes_summary"]["count"], 1)
         self.assertEqual(quality["skipped_unskinned_meshes_summary"]["node_indices"], [2])
         self.assertEqual(quality["skipped_unskinned_meshes_summary"]["mesh_indices"], [0])
@@ -185,11 +322,15 @@ class ConvertModelTest(unittest.TestCase):
         self.assertEqual(largest["owner_bone_name"], "root_joint")
         self.assertEqual(largest["dimensions"], [40.0, 4.0, 0.0])
         self.assertIsNone(largest["rotation_source"])
+        self.assertEqual(quality["oversized_cubes"][0]["name"], "root_joint_cube")
+        self.assertEqual(quality["oversized_cubes"][0]["reason"], "largest_by_volume")
 
         elongated = quality["unrotated_elongated_cubes"][0]
         self.assertEqual(elongated["name"], "root_joint_cube")
         self.assertIn("no rotation", elongated["reason"])
         self.assertEqual(quality["tiny_fragment_cubes"], [])
+        self.assertEqual(quality["split_diagnostics"], [])
+        self.assertEqual(quality["cube_budget_warnings"], [])
 
     def test_unskinned_meshes_can_assign_by_node_parent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
