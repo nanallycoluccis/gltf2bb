@@ -136,6 +136,24 @@ class OrientedCubeReport:
     owner_bone_name: str
     rotation: list[float]
     source: str
+    reason: str = "accepted"
+    original_bbox_volume: float | None = None
+    oriented_bbox_volume: float | None = None
+    cube_only_compatible: bool = True
+
+
+@dataclass
+class OrientationDecisionReport:
+    name: str
+    owner_bone: int
+    owner_bone_name: str
+    source: str
+    accepted: bool
+    reason: str
+    original_bbox_volume: float
+    oriented_bbox_volume: float | None
+    cube_only_compatible: bool = True
+    rotation: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
 
 
 @dataclass(frozen=True)
@@ -201,5 +219,6 @@ class ConvertResult:
     assigned_unskinned_meshes: list[AssignedUnskinnedMesh]
     skipped_unskinned_meshes: list[SkippedUnskinnedMesh]
     warnings: list[str]
+    orientation_decisions: list[OrientationDecisionReport] = field(default_factory=list)
     cube_budget_warning_threshold: int = 64
     cube_owner_budget_warning_threshold: int = 16

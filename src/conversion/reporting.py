@@ -30,6 +30,7 @@ from .types import (
     FaceFeatureProtectionAction,
     HybridModeReport,
     OrientedCubeReport,
+    OrientationDecisionReport,
     SkippedUnskinnedMesh,
 )
 
@@ -73,6 +74,7 @@ def convert_result_to_dict(result: ConvertResult) -> dict[str, Any]:
         "complex_split": [complex_split_to_dict(item) for item in result.complex_split],
         "cleanup": cleanup_to_dict(result.cleanup),
         "oriented_cubes": [oriented_cube_to_dict(item) for item in result.oriented_cubes],
+        "orientation_decisions": [orientation_decision_to_dict(item) for item in result.orientation_decisions],
         "quality": quality_to_dict(result),
         "cubes": [cuboid_to_dict(cuboid) for cuboid in result.cubes],
         "warnings": result.warnings,
@@ -226,6 +228,25 @@ def oriented_cube_to_dict(item: OrientedCubeReport) -> dict[str, Any]:
         "owner_bone_name": item.owner_bone_name,
         "rotation": rounded_vec(item.rotation),
         "source": item.source,
+        "reason": item.reason,
+        "original_bbox_volume": rounded_number(item.original_bbox_volume) if item.original_bbox_volume is not None else None,
+        "oriented_bbox_volume": rounded_number(item.oriented_bbox_volume) if item.oriented_bbox_volume is not None else None,
+        "cube_only_compatible": item.cube_only_compatible,
+    }
+
+
+def orientation_decision_to_dict(item: OrientationDecisionReport) -> dict[str, Any]:
+    return {
+        "name": item.name,
+        "owner_bone": item.owner_bone,
+        "owner_bone_name": item.owner_bone_name,
+        "source": item.source,
+        "accepted": item.accepted,
+        "reason": item.reason,
+        "rotation": rounded_vec(item.rotation),
+        "original_bbox_volume": rounded_number(item.original_bbox_volume),
+        "oriented_bbox_volume": rounded_number(item.oriented_bbox_volume) if item.oriented_bbox_volume is not None else None,
+        "cube_only_compatible": item.cube_only_compatible,
     }
 
 

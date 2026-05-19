@@ -76,6 +76,7 @@ from .conversion.types import (
     HairSplitResult,
     HybridModeReport,
     OrientedCubeReport,
+    OrientationDecisionReport,
     PartKey,
     SkippedUnskinnedMesh,
     SplitFace,
@@ -360,7 +361,7 @@ def convert_model(
 
     model_min, model_max = combined_bbox(populated.values())
     scale, offset = compute_scale_and_offset(model_min, model_max, target_height, warnings)
-    cuboids, oriented_cube_report = build_cuboids(
+    cuboids, oriented_cube_report, orientation_decisions = build_cuboids(
         populated,
         bones,
         world_matrices,
@@ -399,6 +400,7 @@ def convert_model(
         assigned_unskinned_meshes=assigned_unskinned_meshes,
         skipped_unskinned_meshes=skipped_unskinned_meshes,
         warnings=warnings,
+        orientation_decisions=orientation_decisions,
     )
     if report_path is not None:
         write_convert_report(result, report_path)
@@ -3054,9 +3056,10 @@ def build_cuboids(
     vrm_humanoid_nodes: dict[str, set[int]],
     *,
     auto_orient: bool = False,
-) -> tuple[list[Cuboid], list[OrientedCubeReport]]:
+) -> tuple[list[Cuboid], list[OrientedCubeReport], list[OrientationDecisionReport]]:
     cuboids: list[Cuboid] = []
     reports: list[OrientedCubeReport] = []
+    decisions: list[OrientationDecisionReport] = []
     for part_key, accumulator in sorted(accumulators.items(), key=lambda item: (item[0].owner_bone, item[0].name)):
         if accumulator.min_xyz is None or accumulator.max_xyz is None:
             continue
@@ -3072,6 +3075,9 @@ def build_cuboids(
         from_xyz = to_blockbench_space(accumulator.min_xyz, scale, offset)
         to_xyz = to_blockbench_space(accumulator.max_xyz, scale, offset)
         original_from_xyz, original_to_xyz = ensure_min_cube_size(from_xyz, to_xyz)
+        original_volume = box_volume(original_from_xyz, original_to_xyz)
+        oriented_volume: float | None = None
+        cube_name = f"{part_key.name}_cube"
 
         if should_orient_accumulator(part_key, accumulator, bones, oriented_cubes, vrm_humanoid_nodes):
             rotation_matrix = normalized_rotation_matrix(world_matrix)
@@ -3087,10 +3093,25 @@ def build_cuboids(
                         candidate_source = "bone_direction"
             if has_nonzero_rotation(candidate_rotation):
                 from_xyz, to_xyz = oriented_accumulator_bounds(accumulator, scale, offset, origin, rotation_matrix)
+                score_from_xyz, score_to_xyz = ensure_min_cube_size(from_xyz, to_xyz)
+                oriented_volume = box_volume(score_from_xyz, score_to_xyz)
                 rotation = candidate_rotation
                 rotation_source = candidate_source
+                decisions.append(
+                    orientation_decision_report(
+                        cube_name,
+                        part_key,
+                        owner_bone_name,
+                        candidate_source,
+                        True,
+                        "accepted",
+                        original_volume,
+                        oriented_volume,
+                        candidate_rotation,
+                    )
+                )
         elif auto_orient:
-            auto_candidate = auto_orient_accumulator(
+            auto_candidate, auto_decisions = auto_orient_accumulator(
                 part_key,
                 accumulator,
                 bones,
@@ -3101,15 +3122,15 @@ def build_cuboids(
                 original_from_xyz,
                 original_to_xyz,
             )
+            decisions.extend(auto_decisions)
             if auto_candidate is not None:
-                from_xyz, to_xyz, rotation, rotation_source = auto_candidate
+                from_xyz, to_xyz, rotation, rotation_source, oriented_volume = auto_candidate
 
         from_xyz, to_xyz = ensure_min_cube_size(
             from_xyz,
             to_xyz,
             allow_zero_axes=zero_thickness_axes(from_xyz, to_xyz),
         )
-        cube_name = f"{part_key.name}_cube"
         cuboids.append(
             Cuboid(
                 owner_bone=part_key.owner_bone,
@@ -3132,9 +3153,13 @@ def build_cuboids(
                     owner_bone_name=owner_bone_name,
                     rotation=rotation,
                     source=rotation_source,
+                    reason="accepted",
+                    original_bbox_volume=original_volume,
+                    oriented_bbox_volume=oriented_volume,
+                    cube_only_compatible=True,
                 )
             )
-    return cuboids, reports
+    return cuboids, reports, decisions
 
 
 def auto_orient_accumulator(
@@ -3147,27 +3172,29 @@ def auto_orient_accumulator(
     origin: list[float],
     original_from_xyz: list[float],
     original_to_xyz: list[float],
-) -> tuple[list[float], list[float], list[float], str] | None:
+) -> tuple[tuple[list[float], list[float], list[float], str, float] | None, list[OrientationDecisionReport]]:
+    cube_name = f"{part_key.name}_cube"
+    decisions: list[OrientationDecisionReport] = []
     bone = bones.get(part_key.owner_bone)
     if bone is None:
-        return None
+        return None, decisions
     if accumulator.min_xyz is None or accumulator.max_xyz is None:
-        return None
+        return None, decisions
     if is_face_feature_name(part_key.name) or is_face_feature_name(bone.name):
-        return None
+        return None, decisions
     if accumulator.is_complex_split and (
         is_head_core_part(part_key.name) or is_face_feature_part(part_key.name) or is_side_feature_part(part_key.name)
     ):
-        return None
+        return None, decisions
     if accumulator.is_complex_split and accumulator.faces < AUTO_ORIENT_MIN_FACES:
-        return None
+        return None, decisions
 
     original_dimensions = bbox_dimensions(original_from_xyz, original_to_xyz)
     original_volume = box_volume_from_dimensions(original_dimensions)
     if max(original_dimensions) < AUTO_ORIENT_MIN_LONG_DIM or original_volume < AUTO_ORIENT_MIN_VOLUME:
-        return None
+        return None, decisions
 
-    best_candidate: tuple[list[float], list[float], list[float], str, float] | None = None
+    best_candidate: tuple[list[float], list[float], list[float], str, float | None, str] | None = None
     direction_matrix = bone_direction_rotation_matrix(part_key.owner_bone, bones, world_matrices)
     if direction_matrix is not None:
         direction_candidate = auto_orient_candidate(
@@ -3179,8 +3206,21 @@ def auto_orient_accumulator(
             original_volume,
             "auto_bone_direction",
         )
-        if direction_candidate is not None:
-            return direction_candidate[:4]
+        decisions.append(
+            orientation_decision_report(
+                cube_name,
+                part_key,
+                bone.name,
+                "auto_bone_direction",
+                direction_candidate[5] == "accepted",
+                direction_candidate[5],
+                original_volume,
+                direction_candidate[4],
+                direction_candidate[2],
+            )
+        )
+        if direction_candidate[5] == "accepted":
+            return direction_candidate[:5], decisions
 
     if should_try_geometry_auto_orient(part_key):
         geometry_min_reduction = (
@@ -3201,10 +3241,25 @@ def auto_orient_accumulator(
             )
             if geometry_candidate is None:
                 continue
+            decisions.append(
+                orientation_decision_report(
+                    cube_name,
+                    part_key,
+                    bone.name,
+                    "auto_geometry_pca",
+                    geometry_candidate[5] == "accepted",
+                    geometry_candidate[5],
+                    original_volume,
+                    geometry_candidate[4],
+                    geometry_candidate[2],
+                )
+            )
+            if geometry_candidate[5] != "accepted":
+                continue
             if best_candidate is None or geometry_candidate[4] < best_candidate[4]:
                 best_candidate = geometry_candidate
 
-    return None if best_candidate is None else best_candidate[:4]
+    return (None, decisions) if best_candidate is None else (best_candidate[:5], decisions)
 
 
 def auto_orient_candidate(
@@ -3216,16 +3271,41 @@ def auto_orient_candidate(
     original_volume: float,
     source: str,
     min_volume_reduction: float = AUTO_ORIENT_MIN_VOLUME_REDUCTION,
-) -> tuple[list[float], list[float], list[float], str, float] | None:
+) -> tuple[list[float], list[float], list[float], str, float | None, str]:
     rotation = matrix_to_euler_xyz_degrees(rotation_matrix)
     if not has_nonzero_rotation(rotation):
-        return None
+        return [], [], rotation, source, None, "axis_aligned_candidate"
     from_xyz, to_xyz = oriented_accumulator_bounds(accumulator, scale, offset, origin, rotation_matrix)
     score_from_xyz, score_to_xyz = ensure_min_cube_size(from_xyz, to_xyz)
     oriented_volume = box_volume(score_from_xyz, score_to_xyz)
     if oriented_volume >= original_volume * (1.0 - min_volume_reduction):
-        return None
-    return from_xyz, to_xyz, rotation, source, oriented_volume
+        return from_xyz, to_xyz, rotation, source, oriented_volume, "insufficient_volume_reduction"
+    return from_xyz, to_xyz, rotation, source, oriented_volume, "accepted"
+
+
+def orientation_decision_report(
+    cube_name: str,
+    part_key: PartKey,
+    owner_bone_name: str,
+    source: str,
+    accepted: bool,
+    reason: str,
+    original_volume: float,
+    oriented_volume: float | None,
+    rotation: list[float],
+) -> OrientationDecisionReport:
+    return OrientationDecisionReport(
+        name=cube_name,
+        owner_bone=part_key.owner_bone,
+        owner_bone_name=owner_bone_name,
+        source=source,
+        accepted=accepted,
+        reason=reason,
+        original_bbox_volume=original_volume,
+        oriented_bbox_volume=oriented_volume,
+        cube_only_compatible=True,
+        rotation=rotation,
+    )
 
 
 def should_try_geometry_auto_orient(part_key: PartKey) -> bool:

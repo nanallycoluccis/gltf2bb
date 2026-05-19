@@ -1138,10 +1138,49 @@ class ConvertModelTest(unittest.TestCase):
             data = json.loads(output_path.read_text(encoding="utf-8"))
             report = json.loads(report_path.read_text(encoding="utf-8"))
 
+        summary = assert_cube_only_bbmodel(self, data)
         self.assertEqual(len(result.oriented_cubes), 1)
         self.assertEqual(report["oriented_cubes"][0]["source"], "auto_bone_direction")
+        self.assertEqual(report["oriented_cubes"][0]["reason"], "accepted")
+        self.assertTrue(report["oriented_cubes"][0]["cube_only_compatible"])
+        self.assertLess(report["oriented_cubes"][0]["oriented_bbox_volume"], report["oriented_cubes"][0]["original_bbox_volume"])
+        accepted_decisions = [item for item in report["orientation_decisions"] if item["accepted"]]
+        self.assertEqual(len(accepted_decisions), 1)
+        self.assertEqual(accepted_decisions[0]["source"], "auto_bone_direction")
+        self.assertEqual(accepted_decisions[0]["reason"], "accepted")
+        self.assertTrue(accepted_decisions[0]["cube_only_compatible"])
+        self.assertLess(accepted_decisions[0]["oriented_bbox_volume"], accepted_decisions[0]["original_bbox_volume"])
         self.assertEqual(data["elements"][0]["name"], "J_Bip_L_Thumb1_cube")
         self.assertAlmostEqual(data["elements"][0]["rotation"][2], -45.0)
+        self.assertIn("J_Bip_L_Thumb1_cube", summary["rotations_by_element"])
+
+    def test_hybrid_mode_rejects_weak_auto_orientation_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "near_axis_thumb.gltf"
+            output_path = Path(temp_dir) / "model.bbmodel"
+            report_path = Path(temp_dir) / "report.json"
+            write_near_axis_thumb_fixture(model_path)
+
+            result = convert_model(
+                model_path,
+                output_path,
+                mode="hybrid",
+                target_height=4.0,
+                report_path=report_path,
+            )
+            data = json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        summary = assert_cube_only_bbmodel(self, data)
+        self.assertEqual(len(result.oriented_cubes), 0)
+        self.assertEqual(report["oriented_cubes"], [])
+        self.assertEqual(summary["rotations_by_element"], {})
+        rejected_decisions = [item for item in report["orientation_decisions"] if not item["accepted"]]
+        self.assertGreaterEqual(len(rejected_decisions), 1)
+        self.assertEqual(rejected_decisions[0]["source"], "auto_bone_direction")
+        self.assertEqual(rejected_decisions[0]["reason"], "insufficient_volume_reduction")
+        self.assertTrue(rejected_decisions[0]["cube_only_compatible"])
+        self.assertGreaterEqual(rejected_decisions[0]["oriented_bbox_volume"], rejected_decisions[0]["original_bbox_volume"] * 0.88)
 
     def test_cleanup_config_deletes_small_parts_before_writing_bbmodel(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1763,6 +1802,61 @@ def write_slanted_thumb_fixture(path: Path) -> None:
             {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"},
             {"bufferView": 1, "componentType": 5121, "count": 3, "type": "VEC4"},
             {"bufferView": 2, "componentType": 5126, "count": 3, "type": "VEC4"},
+        ],
+        "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": len(positions)},
+            {"buffer": 0, "byteOffset": len(positions), "byteLength": len(joints)},
+            {"buffer": 0, "byteOffset": len(positions) + len(joints), "byteLength": len(weights)},
+        ],
+        "buffers": [
+            {
+                "byteLength": len(positions) + len(joints) + len(weights),
+                "uri": f"data:application/octet-stream;base64,{payload}",
+            }
+        ],
+    }
+    path.write_text(json.dumps(model), encoding="utf-8")
+
+
+def write_near_axis_thumb_fixture(path: Path) -> None:
+    points = [
+        (0.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.1, 0.0, 0.0),
+        (0.1, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.1, 1.0, 0.0),
+    ]
+    positions = b"".join(struct.pack("<fff", *point) for point in points)
+    joints = bytes([1, 0, 0, 0] * len(points))
+    weights = b"".join(struct.pack("<ffff", 1.0, 0.0, 0.0, 0.0) for _ in points)
+    payload = base64.b64encode(positions + joints + weights).decode("ascii")
+    model = {
+        "asset": {"version": "2.0", "generator": "gltf2bb near-axis thumb test"},
+        "scene": 0,
+        "scenes": [{"nodes": [3]}],
+        "nodes": [
+            {"name": "Root", "children": [1]},
+            {"name": "J_Bip_L_Thumb1", "children": [2]},
+            {"name": "J_Bip_L_Thumb2", "translation": [0.02, 1.0, 0.0]},
+            {"name": "mesh_node", "mesh": 0, "skin": 0},
+        ],
+        "skins": [{"joints": [0, 1, 2]}],
+        "meshes": [
+            {
+                "name": "near_axis_thumb",
+                "primitives": [
+                    {
+                        "attributes": {"POSITION": 0, "JOINTS_0": 1, "WEIGHTS_0": 2},
+                        "mode": 4,
+                    }
+                ],
+            }
+        ],
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": len(points), "type": "VEC3"},
+            {"bufferView": 1, "componentType": 5121, "count": len(points), "type": "VEC4"},
+            {"bufferView": 2, "componentType": 5126, "count": len(points), "type": "VEC4"},
         ],
         "bufferViews": [
             {"buffer": 0, "byteOffset": 0, "byteLength": len(positions)},
